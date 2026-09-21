@@ -2,7 +2,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const sharp = require('sharp');
-const ffmpegPath = require('ffmpeg-static');
+const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
 const { spawn } = require('child_process');
 
 const MAX_MEDIA_BYTES = 10 * 1024 * 1024;
