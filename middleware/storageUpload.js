@@ -46,7 +46,9 @@ const buildStoragePath = (folder, originalName, extension) => {
 };
 
 const uploadBufferToSupabase = async (buffer, storagePath, contentType) => {
-  const { error } = await supabase.storage.from(supabaseBucket).upload(storagePath, buffer, {
+  const uploadData = new Uint8Array(buffer);
+
+  const { error } = await supabase.storage.from(supabaseBucket).upload(storagePath, uploadData, {
     contentType,
     cacheControl: '31536000',
     upsert: false,
