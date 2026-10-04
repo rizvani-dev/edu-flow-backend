@@ -43,7 +43,7 @@ function generateFeeReceiptPdf({ school, student, payment, fee }) {
       const topY = 150;
 
       // Student Box
-      doc.rect(45, topY, 245, 115).strokeColor(borderColor).lineWidth(1).stroke();
+      doc.rect(45, topY, 245, 135).strokeColor(borderColor).lineWidth(1).stroke();
       doc.rect(45, topY, 245, 24).fill(primaryColor);
       doc.fillColor('#ffffff').fontSize(10).font('Helvetica-Bold')
          .text('STUDENT INFORMATION', 55, topY + 7);
@@ -52,7 +52,7 @@ function generateFeeReceiptPdf({ school, student, payment, fee }) {
       let sy = topY + 32;
       const sDetails = [
         ['Student Name:', student?.name || 'N/A'],
-        ['Student ID:', `#${student?.id || 'N/A'}`],
+        ['Student ID:', student?.student_code || `#${student?.id || 'N/A'}`],
         ['Class & Section:', `${student?.class_name || 'N/A'} ${student?.section ? `(${student.section})` : ''}`],
         ['Email:', student?.email || 'N/A']
       ];
@@ -63,7 +63,7 @@ function generateFeeReceiptPdf({ school, student, payment, fee }) {
       });
 
       // Transaction / Voucher Box
-      doc.rect(305, topY, 245, 115).strokeColor(borderColor).lineWidth(1).stroke();
+      doc.rect(305, topY, 245, 135).strokeColor(borderColor).lineWidth(1).stroke();
       doc.rect(305, topY, 245, 24).fill(primaryColor);
       doc.fillColor('#ffffff').fontSize(10).font('Helvetica-Bold')
          .text('TRANSACTION DETAILS', 315, topY + 7);
@@ -72,6 +72,7 @@ function generateFeeReceiptPdf({ school, student, payment, fee }) {
       const pDetails = [
         ['Fee Month:', `${payment?.month || fee?.month || 'N/A'} ${payment?.year || fee?.year || ''}`],
         ['Transaction ID:', payment?.transaction_id || 'N/A'],
+        ['Paid via:', payment?.payment_method === 'cash' ? 'Hand cash' : 'Online transfer'],
         ['Payment Date:', payment?.created_at ? new Date(payment.created_at).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : 'N/A'],
         ['Payment Status:', (payment?.status || fee?.status || 'PAID').toUpperCase()]
       ];
@@ -86,7 +87,7 @@ function generateFeeReceiptPdf({ school, student, payment, fee }) {
       });
 
       // ================= ITEMIZED BREAKDOWN TABLE =================
-      const tableY = 285;
+      const tableY = 305;
       doc.rect(45, tableY, 505, 26).fill(lightBg);
       doc.rect(45, tableY, 505, 1).fill(primaryColor);
 
@@ -100,6 +101,11 @@ function generateFeeReceiptPdf({ school, student, payment, fee }) {
       // Table Row
       const rowY = tableY + 34;
       const amountNum = Number(fee?.amount || payment?.amount || 0);
+      const baseAmount = Number(fee?.base_amount || amountNum);
+      const fineAmount = Number(fee?.fine_amount || 0);
+      const otherCharges = Number(fee?.other_charges || 0);
+      const taxAmount = Number(fee?.tax_amount || 0);
+      const discountAmount = Number(fee?.discount_amount || 0);
       const dueDateStr = fee?.due_date ? new Date(fee.due_date).toLocaleDateString() : 'Paid on time';
 
       doc.fillColor(textColor).fontSize(9).font('Helvetica')
@@ -112,22 +118,22 @@ function generateFeeReceiptPdf({ school, student, payment, fee }) {
 
       doc.moveTo(45, rowY + 22).lineTo(550, rowY + 22).strokeColor(borderColor).lineWidth(1).stroke();
 
-      // Total Box
+      // Itemized invoice totals
       const totalY = rowY + 35;
-      doc.rect(305, totalY, 245, 60).fill(lightBg);
-      doc.rect(305, totalY, 245, 60).strokeColor(primaryColor).lineWidth(1).stroke();
-
-      doc.fillColor('#475569').fontSize(9).font('Helvetica')
-         .text('Subtotal:', 315, totalY + 10)
-         .text('Tax / Surcharge:', 315, totalY + 26)
-         .font('Helvetica-Bold').fillColor(primaryColor)
-         .text('TOTAL PAID:', 315, totalY + 42);
-
-      doc.fillColor(textColor).fontSize(9).font('Helvetica')
-         .text(`PKR ${amountNum.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 430, totalY + 10, { width: 110, align: 'right' })
-         .text('PKR 0.00', 430, totalY + 26, { width: 110, align: 'right' })
-         .font('Helvetica-Bold').fillColor('#16a34a')
-         .text(`PKR ${amountNum.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 430, totalY + 42, { width: 110, align: 'right' });
+      doc.rect(305, totalY, 245, 102).fill(lightBg);
+      doc.rect(305, totalY, 245, 102).strokeColor(primaryColor).lineWidth(1).stroke();
+      const breakdown = [
+        ['Tuition / base fee:', baseAmount], ['Fine:', fineAmount], ['Other charges:', otherCharges],
+        [`Tax (${Number(fee?.tax_rate || 0)}%):`, taxAmount], ['Discount:', -discountAmount], ['TOTAL PAID:', amountNum],
+      ];
+      breakdown.forEach(([label, value], index) => {
+        const isTotal = index === breakdown.length - 1;
+        const y = totalY + 7 + index * 15;
+        doc.font(isTotal ? 'Helvetica-Bold' : 'Helvetica').fillColor(isTotal ? '#16a34a' : '#475569').fontSize(isTotal ? 9 : 8)
+          .text(label, 315, y);
+        doc.font(isTotal ? 'Helvetica-Bold' : 'Helvetica').fillColor(isTotal ? '#16a34a' : textColor).fontSize(isTotal ? 9 : 8)
+          .text(`PKR ${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 430, y, { width: 110, align: 'right' });
+      });
 
       // Important Notes
       doc.fillColor('#64748b').fontSize(8).font('Helvetica')

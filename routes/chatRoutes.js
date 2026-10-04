@@ -10,6 +10,7 @@ const {
   deleteMessagesBulk,
 } = require('../controllers/chatController');
 const {
+  getSchoolAdmins,
   getConversationMessages,
   sendConversationMessage,
 } = require('../controllers/conversationController');
@@ -33,6 +34,7 @@ router.post('/chat-upload', uploadChat.single('file'), (req, res) => {
 });
 
 router.post('/bulk-delete', deleteMessagesBulk);
+router.get('/admins', getSchoolAdmins);
 router.post('/conversation/:userId', uploadChat.single('file'), sendConversationMessage);
 router.get('/conversation/:userId', getConversationMessages);
 router.post('/:studentId', uploadChat.single('file'), sendTeacherMessage);

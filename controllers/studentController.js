@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const { normalizeStoredMediaPath } = require('../utils/media');
 const { withCache } = require('../services/cacheService');
+const { del } = require('../services/cacheService');
 
 // Get Student Dashboard - Only own data
 const getDashboard = async (req, res) => {
@@ -9,18 +10,18 @@ const getDashboard = async (req, res) => {
   try {
     const payload = await withCache(`student:dashboard:${studentId}`, async () => {
       const studentQuery = await pool.query(`
-        SELECT u.id, u.name, u.email, u.class_id, u.bio, u.profile_image,
+        SELECT u.id, u.student_code, u.name, u.email, u.class_id, u.bio, u.profile_image,
                c.name as student_class_name,
                s.name as school_name, s.logo_url as school_logo_url,
                t.id as teacher_id, t.name as teacher_name, t.profile_image as teacher_image, t.bio as teacher_bio, t.online as teacher_online, t.last_seen as teacher_last_seen,
                tc.name as teacher_class_name
         FROM users u
-        LEFT JOIN classes c ON u.class_id = c.id
+        LEFT JOIN classes c ON u.class_id = c.id AND c.school_id = u.school_id
         LEFT JOIN schools s ON u.school_id = s.id
-        LEFT JOIN users t ON u.teacher_id = t.id
-        LEFT JOIN classes tc ON t.class_id = tc.id
-        WHERE u.id = $1 AND u.role = 'student'
-      `, [studentId]);
+        LEFT JOIN users t ON u.teacher_id = t.id AND t.school_id = u.school_id
+        LEFT JOIN classes tc ON t.class_id = tc.id AND tc.school_id = u.school_id
+        WHERE u.id = $1 AND u.role = 'student' AND u.school_id = $2
+      `, [studentId, req.user.school_id]);
 
       if (studentQuery.rows.length === 0) {
         return { statusCode: 404, body: { success: false, message: 'Student not found' } };
@@ -28,18 +29,17 @@ const getDashboard = async (req, res) => {
 
       const student = studentQuery.rows[0];
       const attendanceQuery = await pool.query(`
-        SELECT id, date, status 
+        SELECT id, student_id, date, status, remarks
         FROM attendance 
-        WHERE student_id = $1 
-        ORDER BY date DESC 
-        LIMIT 30
-      `, [studentId]);
+        WHERE student_id = $1 AND school_id = $2
+        ORDER BY date DESC, id DESC
+      `, [studentId, req.user.school_id]);
       const resultsQuery = await pool.query(`
         SELECT id, subject, marks, created_at 
         FROM results 
-        WHERE student_id = $1 
+        WHERE student_id = $1 AND school_id = $2
         ORDER BY created_at DESC
-      `, [studentId]);
+      `, [studentId, req.user.school_id]);
       const announcementsQuery = await pool.query(`
         SELECT title, description, date 
         FROM announcements 
@@ -50,26 +50,26 @@ const getDashboard = async (req, res) => {
 
       const feesQuery = await pool.query(`
         SELECT * FROM fees 
-        WHERE student_id = $1 
+        WHERE student_id = $1 AND school_id = $2
         ORDER BY year DESC, month DESC 
         LIMIT 12
-      `, [studentId]);
+      `, [studentId, req.user.school_id]);
 
       const homeworkQuery = await pool.query(`
         SELECT h.*, u.name as teacher_name 
         FROM homework h 
         JOIN users u ON u.id = h.teacher_id 
-        WHERE h.class_id = $1 AND COALESCE(h.expires_at, NOW()) >= NOW()
-        ORDER BY h.assigned_date DESC LIMIT 15
-      `, [student.class_id]);
+        WHERE h.class_id = $1 AND h.school_id = $2 AND COALESCE(h.expires_at, h.due_date, h.assigned_date + INTERVAL '7 days') >= NOW()
+        ORDER BY h.due_date ASC NULLS LAST, h.assigned_date DESC LIMIT 100
+      `, [student.class_id, req.user.school_id]);
 
       const examsQuery = await pool.query(`
         SELECT e.*, er.completed_at, er.score
         FROM exams e
         LEFT JOIN exam_results er ON er.exam_id = e.id AND er.student_id = $1
-        WHERE e.class_id = $2
+        WHERE e.class_id = $2 AND e.school_id = $3
         ORDER BY e.created_at DESC
-      `, [studentId, student.class_id]);
+      `, [studentId, student.class_id, req.user.school_id]);
 
       const totalAttendance = attendanceQuery.rows.length;
       const presentDays = attendanceQuery.rows.filter(a => a.status === 'present' || a.status === 'late').length;
@@ -95,6 +95,7 @@ const getDashboard = async (req, res) => {
           dashboard: {
             student: {
               id: student.id,
+              student_code: student.student_code,
               name: student.name,
               email: student.email,
               class_name: student.student_class_name || "Not Assigned",
@@ -125,7 +126,7 @@ const getDashboard = async (req, res) => {
           }
         }
       };
-    }, 60);
+    }, 10);
 
     res.status(payload.statusCode).json(payload.body);
   } catch (error) {
@@ -134,6 +135,38 @@ const getDashboard = async (req, res) => {
       success: false, 
       message: 'Server error loading dashboard' 
     });
+  }
+};
+
+const updateStudentProfile = async (req, res) => {
+  const bio = typeof req.body.bio === 'string' ? req.body.bio.trim() : '';
+  if (bio.length > 50) return res.status(400).json({ success: false, message: 'Bio must be 50 characters or fewer' });
+  try {
+    const { rows } = await pool.query(
+      `UPDATE users SET bio = $1 WHERE id = $2 AND role = 'student' AND school_id = $3
+       RETURNING id, name, email, bio, profile_image`,
+      [bio || null, req.user.id, req.user.school_id]
+    );
+    if (!rows.length) return res.status(404).json({ success: false, message: 'Student profile not found' });
+    await del(`student:dashboard:${req.user.id}`);
+    return res.json({ success: true, profile: rows[0] });
+  } catch (error) {
+    console.error('Update Student Profile Error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to update profile' });
+  }
+};
+
+const getMyLoginDevices = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, device_label, user_agent, ip_address, created_at, last_seen_at
+       FROM login_sessions WHERE user_id = $1 ORDER BY last_seen_at DESC LIMIT 20`,
+      [req.user.id]
+    );
+    res.json({ success: true, devices: rows });
+  } catch (error) {
+    console.error('Get Login Devices Error:', error);
+    res.status(500).json({ success: false, message: 'Could not load login devices' });
   }
 };
 
@@ -146,9 +179,9 @@ const getMyAttendance = async (req, res) => {
       SELECT a.date, a.status, c.name as class_name
       FROM attendance a
       LEFT JOIN classes c ON a.class_id = c.id
-      WHERE a.student_id = $1 
+      WHERE a.student_id = $1 AND a.school_id = $2
       ORDER BY a.date DESC
-    `, [studentId]);
+    `, [studentId, req.user.school_id]);
 
     res.json({ success: true, attendance: rows });
   } catch (error) {
@@ -165,9 +198,9 @@ const getMyResults = async (req, res) => {
     const { rows } = await pool.query(`
       SELECT subject, marks, created_at 
       FROM results 
-      WHERE student_id = $1 
+      WHERE student_id = $1 AND school_id = $2
       ORDER BY created_at DESC
-    `, [studentId]);
+    `, [studentId, req.user.school_id]);
 
     res.json({ success: true, results: rows });
   } catch (error) {
@@ -179,5 +212,7 @@ const getMyResults = async (req, res) => {
 module.exports = {
   getDashboard,
   getMyAttendance,
-  getMyResults
+  getMyResults,
+  updateStudentProfile,
+  getMyLoginDevices,
 };

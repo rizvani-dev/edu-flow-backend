@@ -6,6 +6,7 @@ const { createNotification } = require('./notificationController');
 const { mapMediaFieldsList } = require('../utils/media');
 const { del } = require('../services/cacheService');
 const { generateFeeReceiptPdf } = require('../utils/pdfGenerator');
+const { getPrivateProofSignedUrl, deletePrivateProof } = require('../utils/privateStorage');
 
 // Helper for audit logging
 const logAuditAction = async (schoolId, userId, action, entityType, entityId, metadata = {}) => {
@@ -30,6 +31,8 @@ const getTeacherClassId = async (userId, schoolId) => {
   return rows[0]?.class_id || null;
 };
 
+const feeMonths = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
 // @desc    Get fees for a specific student (Student View)
 const getStudentFees = async (req, res) => {
   const studentId = req.user.id;
@@ -38,10 +41,11 @@ const getStudentFees = async (req, res) => {
       `SELECT f.*,
               latest_request.id AS payment_request_id,
               latest_request.status AS payment_request_status,
-              latest_request.transaction_id
+              latest_request.transaction_id,
+              latest_request.payment_method
        FROM fees f
        LEFT JOIN LATERAL (
-         SELECT id, status, transaction_id
+         SELECT id, status, transaction_id, payment_method
          FROM fee_payment_requests
          WHERE fee_id = f.id
          ORDER BY created_at DESC
@@ -88,10 +92,11 @@ const getCurrentFee = async (req, res) => {
               latest_request.id AS payment_request_id,
               latest_request.status AS request_status,
               latest_request.transaction_id,
+              latest_request.payment_method,
               latest_request.screenshot_url
        FROM fees f
        LEFT JOIN LATERAL (
-         SELECT id, status, transaction_id, screenshot_url
+         SELECT id, status, transaction_id, payment_method, screenshot_url
          FROM fee_payment_requests
          WHERE fee_id = f.id
          ORDER BY created_at DESC
@@ -107,9 +112,17 @@ const getCurrentFee = async (req, res) => {
     // If no fee record exists, show the configured amount without inventing a fallback price.
     if (!fee) {
       const studentRes = await pool.query(
-        `SELECT u.id, u.class_id, fs.monthly_fee 
+      `SELECT u.id, u.class_id,
+                GREATEST(0, fs.monthly_fee + COALESCE(a.fine_amount, fs.fine_amount, 0) + COALESCE(fs.other_charges, 0)
+                  + round(fs.monthly_fee * COALESCE(a.tax_percent, fs.tax_percent, 0) / 100, 2)
+                  - least(COALESCE(a.discount_amount, fs.discount_amount, 0), fs.monthly_fee + COALESCE(a.fine_amount, fs.fine_amount, 0) + COALESCE(fs.other_charges, 0) + round(fs.monthly_fee * COALESCE(a.tax_percent, fs.tax_percent, 0) / 100, 2))) AS monthly_fee,
+                COALESCE(a.tax_percent, fs.tax_percent, 0) AS tax_rate,
+                round(fs.monthly_fee * COALESCE(a.tax_percent, fs.tax_percent, 0) / 100, 2) AS tax_amount,
+                COALESCE(a.fine_amount, fs.fine_amount, 0) AS fine_amount,
+                LEAST(COALESCE(a.discount_amount, fs.discount_amount, 0), fs.monthly_fee + COALESCE(a.fine_amount, fs.fine_amount, 0) + COALESCE(fs.other_charges, 0) + round(fs.monthly_fee * COALESCE(a.tax_percent, fs.tax_percent, 0) / 100, 2)) AS discount_amount
          FROM users u
          LEFT JOIN fee_structures fs ON fs.class_id = u.class_id AND fs.school_id = u.school_id
+         LEFT JOIN student_fee_adjustments a ON a.school_id = u.school_id AND a.student_id = u.id
          WHERE u.id = $1 AND u.role = 'student'`,
         [studentId]
       );
@@ -123,6 +136,10 @@ const getCurrentFee = async (req, res) => {
         month: currentMonth,
         year: currentYear,
         amount: configuredAmount,
+        tax_rate: studentInfo?.tax_rate || 0,
+        tax_amount: studentInfo?.tax_amount || 0,
+        fine_amount: studentInfo?.fine_amount || 0,
+        discount_amount: studentInfo?.discount_amount || 0,
         status: configuredAmount == null ? 'unavailable' : 'unpaid',
         due_date: new Date(currentYear, now.getMonth(), 10).toISOString().split('T')[0],
         remarks: configuredAmount == null ? 'No fee structure configured for this class' : 'Configured monthly school fee'
@@ -160,9 +177,10 @@ const getEligibleMonths = async (req, res) => {
               latest_request.id AS payment_request_id,
               latest_request.status AS payment_request_status,
               latest_request.transaction_id
+              , latest_request.payment_method
        FROM fees f
        LEFT JOIN LATERAL (
-         SELECT id, status, transaction_id
+         SELECT id, status, transaction_id, payment_method
          FROM fee_payment_requests
          WHERE fee_id = f.id
          ORDER BY created_at DESC
@@ -228,14 +246,14 @@ const getClassFees = async (req, res) => {
       SELECT f.*, u.name as student_name, u.email as student_email, c.name as class_name,
              latest_request.id AS payment_request_id,
              latest_request.status AS payment_request_status,
-             latest_request.transaction_id,
+              latest_request.transaction_id, latest_request.payment_method,
              latest_request.screenshot_url,
              latest_request.remarks AS payment_request_remarks
       FROM fees f
-      JOIN users u ON f.student_id = u.id
-      LEFT JOIN classes c ON u.class_id = c.id
+      JOIN users u ON f.student_id = u.id AND u.school_id = f.school_id AND u.role = 'student'
+      LEFT JOIN classes c ON u.class_id = c.id AND c.school_id = u.school_id
       LEFT JOIN LATERAL (
-        SELECT id, status, transaction_id, screenshot_url, remarks
+        SELECT id, status, transaction_id, payment_method, screenshot_url, remarks
         FROM fee_payment_requests
         WHERE fee_id = f.id
         ORDER BY created_at DESC
@@ -261,7 +279,11 @@ const createTeacherFeeProposal = async (req, res) => {
   const schoolId = req.user.school_id;
   const { month, year, due_date, amount: proposedAmount } = req.body;
 
-  if (!month || !Number.isInteger(Number(year))) {
+  const normalizedMonth = feeMonths.find((item) => item.toLowerCase() === String(month || '').trim().toLowerCase());
+  const numericYear = Number(year);
+  const validDueDate = !due_date || (typeof due_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(due_date) && !Number.isNaN(Date.parse(`${due_date}T00:00:00Z`)));
+  const amount = proposedAmount === '' || proposedAmount == null ? null : Number(proposedAmount);
+  if (!normalizedMonth || !Number.isInteger(numericYear) || numericYear < 2000 || numericYear > 2200 || !validDueDate || (amount !== null && (!Number.isFinite(amount) || amount <= 0))) {
     return res.status(400).json({ success: false, message: 'Month and year are required' });
   }
 
@@ -271,44 +293,107 @@ const createTeacherFeeProposal = async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const structure = await client.query(
-      `SELECT monthly_fee FROM fee_structures
-       WHERE school_id = $1 AND class_id = $2`,
-      [schoolId, classId]
+    const result = await client.query(
+      `INSERT INTO fee_proposals (school_id, teacher_id, class_id, month, year, due_date, proposed_amount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [schoolId, teacherId, classId, normalizedMonth, numericYear, due_date || null, amount]
     );
-    const configuredAmount = structure.rows[0]?.monthly_fee;
-    const amount = configuredAmount == null ? Number(proposedAmount) : Number(configuredAmount);
-    if (configuredAmount == null && (!Number.isFinite(amount) || amount <= 0)) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, code: 'FEE_AMOUNT_REQUIRED', message: 'Enter a valid monthly fee amount for this proposal or configure the class fee structure' });
-    }
-
-    const students = await client.query(
-      `SELECT id FROM users
-       WHERE school_id = $1 AND class_id = $2 AND role = 'student'`,
-      [schoolId, classId]
-    );
-    let createdCount = 0;
-    for (const student of students.rows) {
-      const result = await client.query(
-        `INSERT INTO fees (school_id, student_id, class_id, month, year, amount, status, due_date, updated_by)
-         VALUES ($1, $2, $3, $4, $5, $6, 'unpaid', $7, $8)
-         ON CONFLICT (student_id, month, year) DO NOTHING
-         RETURNING id`,
-        [schoolId, student.id, classId, String(month).trim(), Number(year), amount, due_date || null, teacherId]
-      );
-      createdCount += result.rowCount;
-    }
     await client.query('COMMIT');
-    await logAuditAction(schoolId, teacherId, 'FEE_PROPOSAL_CREATED', 'FEES', null, { class_id: classId, month, year, createdCount });
-    return res.status(201).json({ success: true, message: `Fee proposal created for ${createdCount} students`, createdCount });
+    await logAuditAction(schoolId, teacherId, 'FEE_PROPOSAL_SUBMITTED', 'FEE_PROPOSAL', result.rows[0].id, { class_id: classId, month: normalizedMonth, year: numericYear });
+    return res.status(201).json({ success: true, message: 'Fee proposal submitted for admin approval', proposal: result.rows[0] });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error.code === '23505') return res.status(409).json({ success: false, message: 'A proposal for this class and month is already awaiting review' });
     console.error('Create Teacher Fee Proposal Error:', error);
     return res.status(500).json({ success: false, message: 'Failed to create fee proposal' });
   } finally {
     client.release();
   }
+};
+
+const listFeeProposals = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT p.*, t.name AS teacher_name, c.name AS class_name, c.grade_level, c.section,
+              fs.monthly_fee + COALESCE(fs.fine_amount, 0) + COALESCE(fs.other_charges, 0) AS configured_amount
+       FROM fee_proposals p
+       JOIN users t ON t.id = p.teacher_id AND t.school_id = p.school_id
+       JOIN classes c ON c.id = p.class_id AND c.school_id = p.school_id
+       LEFT JOIN fee_structures fs ON fs.school_id = p.school_id AND fs.class_id = p.class_id
+       WHERE p.school_id = $1 AND p.status = 'pending'
+       ORDER BY p.created_at ASC`, [req.user.school_id]
+    );
+    return res.json({ success: true, proposals: rows });
+  } catch (error) {
+    console.error('List Fee Proposals Error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load fee proposals' });
+  }
+};
+
+const reviewFeeProposal = async (req, res) => {
+  const { proposalId } = req.params;
+  const { status, approved_amount: submittedAmount, remarks } = req.body;
+  if (!['approved', 'rejected'].includes(status)) return res.status(400).json({ success: false, message: 'Choose approve or reject' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const selected = await client.query(
+      `SELECT p.*, fs.monthly_fee, COALESCE(fs.fine_amount, 0) AS fine_amount,
+              COALESCE(fs.other_charges, 0) AS other_charges
+       FROM fee_proposals p LEFT JOIN fee_structures fs ON fs.school_id = p.school_id AND fs.class_id = p.class_id
+       WHERE p.id = $1 AND p.school_id = $2 FOR UPDATE OF p`, [proposalId, req.user.school_id]
+    );
+    if (!selected.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'Proposal not found' }); }
+    const proposal = selected.rows[0];
+    if (proposal.status !== 'pending') { await client.query('ROLLBACK'); return res.status(409).json({ success: false, message: 'Proposal has already been reviewed' }); }
+    let createdCount = 0;
+    let approvedAmount = null;
+    if (status === 'approved') {
+      approvedAmount = submittedAmount === '' || submittedAmount == null
+        ? (proposal.proposed_amount == null ? Number(proposal.monthly_fee) + Number(proposal.fine_amount) + Number(proposal.other_charges) : Number(proposal.proposed_amount))
+        : Number(submittedAmount);
+      if (!Number.isFinite(approvedAmount) || approvedAmount <= 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Enter a valid approved amount greater than zero' });
+      }
+      const dueDate = proposal.due_date || new Date(proposal.year, feeMonths.indexOf(proposal.month), 10);
+      const inserted = await client.query(
+        `INSERT INTO fees (school_id, student_id, class_id, month, year, amount, fine_amount, other_charges, status, due_date, updated_by)
+         SELECT $1, u.id, u.class_id, $2, $3, $4, $5, $6, 'unpaid', $7, $8
+         FROM users u WHERE u.school_id = $1 AND u.class_id = $9 AND u.role = 'student'
+         ON CONFLICT (student_id, month, year) DO NOTHING`,
+        [req.user.school_id, proposal.month, proposal.year, approvedAmount, proposal.fine_amount, proposal.other_charges, dueDate, req.user.id, proposal.class_id]
+      );
+      createdCount = inserted.rowCount;
+    }
+    const updated = await client.query(
+      `UPDATE fee_proposals SET status = $1, approved_amount = $2, reviewed_by = $3,
+       reviewed_at = CURRENT_TIMESTAMP, review_remarks = $4 WHERE id = $5 RETURNING *`,
+      [status, approvedAmount, req.user.id, typeof remarks === 'string' ? remarks.trim() || null : null, proposalId]
+    );
+    await client.query('COMMIT');
+    await logAuditAction(req.user.school_id, req.user.id, `FEE_PROPOSAL_${status.toUpperCase()}`, 'FEE_PROPOSAL', proposalId, { created_count: createdCount, approved_amount: approvedAmount });
+    try {
+      await createNotification(
+        proposal.teacher_id,
+        status === 'approved' ? 'Fee Proposal Approved' : 'Fee Proposal Rejected',
+        status === 'approved'
+          ? `${proposal.month} ${proposal.year} proposal approved. ${createdCount} student invoices were created.`
+          : `${proposal.month} ${proposal.year} fee proposal was rejected.${remarks ? ` Admin note: ${String(remarks).trim()}` : ''}`,
+        status === 'approved' ? 'fee_proposal_approved' : 'fee_proposal_rejected',
+        req.user.id,
+        req.app.get('socketio')
+      );
+    } catch (notificationError) {
+      console.warn('Fee proposal notification failed:', notificationError.message);
+    }
+    return res.json({ success: true, message: status === 'approved' ? `Proposal approved; ${createdCount} invoices created` : 'Proposal rejected', proposal: updated.rows[0], createdCount });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Review Fee Proposal Error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to review fee proposal' });
+  } finally { client.release(); }
 };
 
 // @desc    Teacher/Admin approves student fee status
@@ -359,19 +444,95 @@ const updateFeeStatus = async (req, res) => {
   }
 };
 
+// Teachers can report a cash payment, but only an admin can confirm it.
+const createTeacherCashStatusRequest = async (req, res) => {
+  const teacherId = req.user.id;
+  const schoolId = req.user.school_id;
+  const { fee_id: feeId, remarks } = req.body;
+  const classId = await getTeacherClassId(teacherId, schoolId);
+  if (!classId) return res.status(403).json({ success: false, message: 'Teacher is not assigned to a class' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const feeResult = await client.query(
+      `SELECT f.* FROM fees f
+       JOIN users u ON u.id = f.student_id
+       WHERE f.id = $1 AND f.school_id = $2 AND u.class_id = $3 AND u.role = 'student'
+       FOR UPDATE`, [feeId, schoolId, classId]
+    );
+    if (!feeResult.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Fee record not found for your class' });
+    }
+    const fee = feeResult.rows[0];
+    if (fee.status === 'paid') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'This fee is already paid' });
+    }
+    const existing = await client.query(
+      `SELECT id FROM fee_payment_requests WHERE fee_id = $1 AND status = 'pending' LIMIT 1`, [feeId]
+    );
+    if (existing.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'A payment request is already awaiting admin review' });
+    }
+    const transactionId = `CASH-${feeId}-${Date.now()}-${require('crypto').randomUUID()}`;
+    const request = await client.query(
+      `INSERT INTO fee_payment_requests (school_id, student_id, fee_id, transaction_id, payment_method, status, remarks, month, year, amount, transaction_key)
+       VALUES ($1, $2, $3, $4, 'cash', 'pending', $5, $6, $7, $8, $9) RETURNING *`,
+      [schoolId, fee.student_id, feeId, transactionId, remarks?.trim() || 'Cash payment reported by class teacher', fee.month, fee.year, fee.amount, `${schoolId}:${transactionId.toLowerCase()}`]
+    );
+    await client.query(
+      `UPDATE fees SET status = 'pending', updated_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND school_id = $3`,
+      [teacherId, feeId, schoolId]
+    );
+    await client.query('COMMIT');
+    await del(`student:dashboard:${fee.student_id}`);
+    const admins = await pool.query(`SELECT id FROM users WHERE school_id = $1 AND role = 'admin'`, [schoolId]);
+    const io = req.app.get('socketio');
+    try {
+      await Promise.all(admins.rows.map((admin) => createNotification(
+        admin.id, 'Cash Fee Confirmation Requested',
+        `Teacher reported cash received for ${fee.month} ${fee.year} [requestId:${request.rows[0].id}] [feeId:${feeId}]`,
+        'fee_payment_request', request.rows[0].id, io
+      )));
+    } catch (notificationError) {
+      console.warn('Cash fee request notification failed:', notificationError.message);
+    }
+    return res.status(201).json({ success: true, message: 'Cash payment sent to an admin for approval', request: request.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Teacher cash fee request error:', error);
+    return res.status(500).json({ success: false, message: 'Could not send the cash payment for admin approval' });
+  } finally {
+    client.release();
+  }
+};
+
 // @desc    Admin updates full fee record
 const editFee = async (req, res) => {
   const { feeId } = req.params;
   const schoolId = req.user.school_id;
   const { month, year, amount, status, due_date, remarks } = req.body;
   const adminId = req.user.id;
+  const normalizedMonth = feeMonths.find((item) => item.toLowerCase() === String(month || '').trim().toLowerCase());
+  const numericYear = Number(year);
+  const numericAmount = Number(amount);
+  const validStatuses = ['unpaid', 'pending', 'paid', 'partial', 'overdue', 'rejected'];
+  const normalizedStatus = String(status || '').trim().toLowerCase();
+  const parsedDueDate = typeof due_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(due_date) ? Date.parse(`${due_date}T00:00:00Z`) : NaN;
+  const validDueDate = !due_date || (!Number.isNaN(parsedDueDate) && new Date(parsedDueDate).toISOString().slice(0, 10) === due_date);
+
+  if (!normalizedMonth || !Number.isInteger(numericYear) || numericYear < 2000 || numericYear > 2200 || !Number.isFinite(numericAmount) || numericAmount < 0 || !validStatuses.includes(normalizedStatus) || !validDueDate) {
+    return res.status(400).json({ success: false, message: 'Enter a valid billing period, amount, status, and due date' });
+  }
 
   try {
     const { rows } = await pool.query(
       `UPDATE fees 
        SET month = $1, year = $2, amount = $3, status = $4, due_date = $5, updated_by = $6, remarks = $7, updated_at = CURRENT_TIMESTAMP 
        WHERE id = $8 AND school_id = $9 RETURNING *`,
-      [month, year, amount, status, due_date, adminId, remarks, feeId, schoolId]
+      [normalizedMonth, numericYear, numericAmount, normalizedStatus, due_date || null, adminId, typeof remarks === 'string' ? remarks.trim().slice(0, 1000) : null, feeId, schoolId]
     );
 
     if (rows.length === 0) {
@@ -548,54 +709,41 @@ const getFeeStats = async (req, res) => {
 const adminGenerateFees = async (req, res) => {
   const schoolId = req.user.school_id;
   const { month, year, class_id } = req.body;
-
-  if (!month || !year) {
-    return res.status(400).json({ success: false, message: 'Month and year are required' });
+  const normalizedMonth = feeMonths.find((item) => item.toLowerCase() === String(month || '').trim().toLowerCase());
+  const numericYear = Number(year);
+  const classId = class_id == null || class_id === '' ? null : Number(class_id);
+  if (!normalizedMonth || !Number.isInteger(numericYear) || numericYear < 2000 || numericYear > 2200 || (classId !== null && (!Number.isInteger(classId) || classId < 1))) {
+    return res.status(400).json({ success: false, message: 'Choose a valid month, year, and class' });
   }
 
   try {
-    // 1. Fetch configured fee structure for each class in this school
-    const feeStructuresRes = await pool.query(
-      'SELECT class_id, monthly_fee FROM fee_structures WHERE school_id = $1',
-      [schoolId]
-    );
-    const feeMap = new Map();
-    feeStructuresRes.rows.forEach(r => feeMap.set(Number(r.class_id), Number(r.monthly_fee)));
+    const monthIndex = feeMonths.indexOf(normalizedMonth);
+    const defaultDueDate = new Date(numericYear, monthIndex, 10);
+    const insertResult = await pool.query(`
+      INSERT INTO fees (school_id, student_id, class_id, month, year, amount, fine_amount, other_charges, status, due_date, base_amount, tax_rate, tax_amount, discount_amount)
+      SELECT $1, u.id, u.class_id, $2, $3,
+             GREATEST(0, fs.monthly_fee + COALESCE(a.fine_amount, fs.fine_amount, 0) + COALESCE(fs.other_charges, 0)
+               + round(fs.monthly_fee * COALESCE(a.tax_percent, fs.tax_percent, 0) / 100, 2)
+               - LEAST(COALESCE(a.discount_amount, fs.discount_amount, 0), fs.monthly_fee + COALESCE(a.fine_amount, fs.fine_amount, 0) + COALESCE(fs.other_charges, 0)
+                 + round(fs.monthly_fee * COALESCE(a.tax_percent, fs.tax_percent, 0) / 100, 2))),
+             COALESCE(a.fine_amount, fs.fine_amount, 0), COALESCE(fs.other_charges, 0), 'unpaid', $5,
+             fs.monthly_fee, COALESCE(a.tax_percent, fs.tax_percent, 0),
+             round(fs.monthly_fee * COALESCE(a.tax_percent, fs.tax_percent, 0) / 100, 2),
+             LEAST(COALESCE(a.discount_amount, fs.discount_amount, 0), fs.monthly_fee + COALESCE(a.fine_amount, fs.fine_amount, 0) + COALESCE(fs.other_charges, 0) + round(fs.monthly_fee * COALESCE(a.tax_percent, fs.tax_percent, 0) / 100, 2))
+      FROM users u
+      JOIN fee_structures fs ON fs.school_id = u.school_id AND fs.class_id = u.class_id
+      LEFT JOIN student_fee_adjustments a ON a.school_id = u.school_id AND a.student_id = u.id
+      WHERE u.school_id = $1 AND u.role = 'student'
+        AND ($4::integer IS NULL OR u.class_id = $4)
+      ON CONFLICT (student_id, month, year) DO NOTHING
+    `, [schoolId, normalizedMonth, numericYear, classId, defaultDueDate]);
+    const createdCount = insertResult.rowCount;
 
-    // 2. Fetch only students belonging to this school
-    let studentQuery = "SELECT id, class_id FROM users WHERE role = 'student' AND school_id = $1";
-    const queryParams = [schoolId];
-
-    if (class_id) {
-      studentQuery += ' AND class_id = $2';
-      queryParams.push(class_id);
-    }
-
-    const students = await pool.query(studentQuery, queryParams);
-    let createdCount = 0;
-
-    const defaultDueDate = new Date(year, new Date(`${month} 1, 2026`).getMonth() || new Date().getMonth(), 10);
-
-    for (const student of students.rows) {
-      const configuredClassFee = student.class_id ? feeMap.get(Number(student.class_id)) : null;
-      if (configuredClassFee == null) continue;
-      const finalAmount = configuredClassFee;
-
-      const insertRes = await pool.query(`
-        INSERT INTO fees (school_id, student_id, class_id, month, year, amount, status, due_date)
-        VALUES ($1, $2, $3, $4, $5, $6, 'unpaid', $7)
-        ON CONFLICT (student_id, month, year) DO NOTHING
-        RETURNING id
-      `, [schoolId, student.id, student.class_id, month, year, finalAmount, defaultDueDate]);
-
-      if (insertRes.rowCount > 0) createdCount++;
-    }
-
-    await logAuditAction(schoolId, req.user.id, 'FEE_GENERATED', 'FEES', null, { month, year, createdCount });
+    await logAuditAction(schoolId, req.user.id, 'FEE_GENERATED', 'FEES', null, { month: normalizedMonth, year: numericYear, class_id: classId, createdCount });
 
     res.json({
       success: true,
-      message: `Monthly fees generated successfully for ${month} ${year} (${createdCount} records created)`
+      message: `Monthly fees generated successfully for ${normalizedMonth} ${numericYear} (${createdCount} records created)`
     });
   } catch (error) {
     console.error('Admin Generate Fees Error:', error);
@@ -609,7 +757,9 @@ const getFeeStructure = async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT c.id AS class_id, c.name AS class_name, c.grade_level, c.section,
-             fs.monthly_fee,
+             fs.monthly_fee, COALESCE(fs.fine_amount, 0) AS fine_amount,
+             COALESCE(fs.other_charges, 0) AS other_charges,
+             COALESCE(fs.tax_percent, 0) AS tax_percent, COALESCE(fs.discount_amount, 0) AS discount_amount,
              fs.id AS structure_id,
              fs.effective_from
       FROM classes c
@@ -629,27 +779,101 @@ const getFeeStructure = async (req, res) => {
 const saveFeeStructure = async (req, res) => {
   const schoolId = req.user.school_id;
   const adminId = req.user.id;
-  const { class_id, monthly_fee } = req.body;
+  const { class_id, monthly_fee, fine_amount = 0, other_charges = 0, tax_percent = 0, discount_amount = 0 } = req.body;
 
-  if (!class_id || monthly_fee == null) {
-    return res.status(400).json({ success: false, message: 'Class ID and monthly fee are required' });
+  const monthlyFee = Number(monthly_fee);
+  const fineAmount = Number(fine_amount);
+  const otherCharges = Number(other_charges);
+  const taxPercent = Number(tax_percent);
+  const discountAmount = Number(discount_amount);
+  const classId = Number(class_id);
+  if (!Number.isInteger(classId) || classId < 1 || !Number.isFinite(monthlyFee) || monthlyFee < 0 || !Number.isFinite(fineAmount) || fineAmount < 0 || !Number.isFinite(otherCharges) || otherCharges < 0 || !Number.isFinite(taxPercent) || taxPercent < 0 || taxPercent > 100 || !Number.isFinite(discountAmount) || discountAmount < 0) {
+    return res.status(400).json({ success: false, message: 'Enter valid non-negative fee amounts' });
   }
 
   try {
     const { rows } = await pool.query(`
-      INSERT INTO fee_structures (school_id, class_id, monthly_fee, created_by, effective_from)
-      VALUES ($1, $2, $3, $4, CURRENT_DATE)
+      INSERT INTO fee_structures (school_id, class_id, monthly_fee, fine_amount, other_charges, created_by, effective_from, tax_percent, discount_amount)
+      SELECT $1, c.id, $3, $4, $5, $6, CURRENT_DATE, $7, $8 FROM classes c WHERE c.id = $2 AND c.school_id = $1
       ON CONFLICT (school_id, class_id)
-      DO UPDATE SET monthly_fee = EXCLUDED.monthly_fee, effective_from = CURRENT_DATE
+      DO UPDATE SET monthly_fee = EXCLUDED.monthly_fee, fine_amount = EXCLUDED.fine_amount,
+                    other_charges = EXCLUDED.other_charges, tax_percent = EXCLUDED.tax_percent,
+                    discount_amount = EXCLUDED.discount_amount, effective_from = CURRENT_DATE
       RETURNING *
-    `, [schoolId, class_id, Number(monthly_fee), adminId]);
+    `, [schoolId, classId, monthlyFee, fineAmount, otherCharges, adminId, taxPercent, discountAmount]);
 
-    await logAuditAction(schoolId, adminId, 'FEE_STRUCTURE_UPDATED', 'FEE_STRUCTURE', rows[0].id, { class_id, monthly_fee });
+    if (!rows.length) return res.status(404).json({ success: false, message: 'Class not found in this school' });
+
+    await logAuditAction(schoolId, adminId, 'FEE_STRUCTURE_UPDATED', 'FEE_STRUCTURE', rows[0].id, { class_id, monthly_fee: monthlyFee, fine_amount: fineAmount, other_charges: otherCharges });
 
     res.json({ success: true, message: 'Fee structure updated successfully', structure: rows[0] });
   } catch (error) {
     console.error('Save Fee Structure Error:', error);
     res.status(500).json({ success: false, message: 'Failed to save fee structure' });
+  }
+};
+
+const saveStudentFeeAdjustment = async (req, res) => {
+  const schoolId = req.user.school_id;
+  const studentId = Number(req.body.student_id);
+  const toOptionalAmount = (value) => value === '' || value === null || value === undefined ? null : Number(value);
+  const fineAmount = toOptionalAmount(req.body.fine_amount);
+  const taxPercent = toOptionalAmount(req.body.tax_percent);
+  const discountAmount = toOptionalAmount(req.body.discount_amount);
+  if (!Number.isInteger(studentId) || studentId < 1 ||
+      (fineAmount !== null && (!Number.isFinite(fineAmount) || fineAmount < 0)) ||
+      (taxPercent !== null && (!Number.isFinite(taxPercent) || taxPercent < 0 || taxPercent > 100)) ||
+      (discountAmount !== null && (!Number.isFinite(discountAmount) || discountAmount < 0))) {
+    return res.status(400).json({ success: false, message: 'Choose a student and enter valid adjustment values' });
+  }
+  try {
+    const student = await pool.query("SELECT id FROM users WHERE id = $1 AND school_id = $2 AND role = 'student'", [studentId, schoolId]);
+    if (!student.rowCount) return res.status(404).json({ success: false, message: 'Student not found in this school' });
+    if (fineAmount === null && taxPercent === null && discountAmount === null) {
+      await pool.query('DELETE FROM student_fee_adjustments WHERE school_id = $1 AND student_id = $2', [schoolId, studentId]);
+      return res.json({ success: true, message: 'Student adjustments reset to class defaults' });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO student_fee_adjustments (school_id, student_id, fine_amount, tax_percent, discount_amount, remarks, updated_by, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+       ON CONFLICT (school_id, student_id) DO UPDATE SET fine_amount = EXCLUDED.fine_amount,
+         tax_percent = EXCLUDED.tax_percent, discount_amount = EXCLUDED.discount_amount,
+         remarks = EXCLUDED.remarks, updated_by = EXCLUDED.updated_by, updated_at = CURRENT_TIMESTAMP
+       RETURNING *`,
+      [schoolId, studentId, fineAmount, taxPercent, discountAmount, String(req.body.remarks || '').trim() || null, req.user.id]
+    );
+    await logAuditAction(schoolId, req.user.id, 'STUDENT_FEE_ADJUSTMENT_UPDATED', 'STUDENT_FEE_ADJUSTMENT', rows[0].id, { student_id: studentId });
+    return res.json({ success: true, message: 'Student fee adjustments saved', adjustment: rows[0] });
+  } catch (error) {
+    console.error('Save Student Fee Adjustment Error:', error);
+    return res.status(500).json({ success: false, message: 'Could not save student fee adjustments' });
+  }
+};
+
+const getStudentFeeAdjustment = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT a.* FROM student_fee_adjustments a JOIN users u ON u.id = a.student_id AND u.school_id = a.school_id
+       WHERE a.school_id = $1 AND a.student_id = $2 AND u.role = 'student'`, [req.user.school_id, req.params.studentId]
+    );
+    return res.json({ success: true, adjustment: rows[0] || null });
+  } catch (error) {
+    console.error('Get Student Fee Adjustment Error:', error);
+    return res.status(500).json({ success: false, message: 'Could not load student fee adjustments' });
+  }
+};
+
+const listFeeStudents = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.id, u.student_code, u.name, u.class_id, c.name AS class_name, c.section
+       FROM users u LEFT JOIN classes c ON c.id = u.class_id AND c.school_id = u.school_id
+       WHERE u.school_id = $1 AND u.role = 'student' ORDER BY u.name`, [req.user.school_id]
+    );
+    return res.json({ success: true, students: rows });
+  } catch (error) {
+    console.error('List Fee Students Error:', error);
+    return res.status(500).json({ success: false, message: 'Could not load student list' });
   }
 };
 
@@ -700,6 +924,7 @@ async function createFeePaymentRequest(req, res) {
   const file = req.file;
 
   if (!transaction_id?.trim()) {
+    await deletePrivateProof(file?.path).catch(() => {});
     return res.status(400).json({ success: false, message: 'Transaction ID is required' });
   }
 
@@ -708,10 +933,12 @@ async function createFeePaymentRequest(req, res) {
   }
 
   if (!fee_id) {
+    await deletePrivateProof(file.path).catch(() => {});
     return res.status(400).json({ success: false, message: 'Select a monthly fee record before submitting payment' });
   }
 
   const client = await pool.connect();
+  let committed = false;
   try {
     await client.query('BEGIN');
     const feeRes = await client.query(
@@ -731,16 +958,19 @@ async function createFeePaymentRequest(req, res) {
     );
     if (!feeRes.rows.length) {
       await client.query('ROLLBACK');
+      await deletePrivateProof(file.path).catch(() => {});
       return res.status(403).json({ success: false, message: 'Invalid fee record selected' });
     }
 
     const feeRecord = feeRes.rows[0];
     if (feeRecord.status === 'paid' || feeRecord.has_approved_request) {
       await client.query('ROLLBACK');
+      await deletePrivateProof(file.path).catch(() => {});
       return res.status(400).json({ success: false, message: 'This month is already marked as PAID' });
     }
     if (feeRecord.has_pending_request) {
       await client.query('ROLLBACK');
+      await deletePrivateProof(file.path).catch(() => {});
       return res.status(409).json({ success: false, message: 'A payment verification request is already pending review for this month' });
     }
 
@@ -748,14 +978,25 @@ async function createFeePaymentRequest(req, res) {
     const targetYear = feeRecord.year;
     const targetAmount = feeRecord.amount;
 
+    const normalizedTransaction = transaction_id.trim().toLowerCase();
+    const duplicateTransaction = await client.query(
+      'SELECT id FROM fee_payment_requests WHERE school_id = $1 AND lower(trim(transaction_id)) = $2 LIMIT 1',
+      [schoolId, normalizedTransaction]
+    );
+    if (duplicateTransaction.rowCount) {
+      await client.query('ROLLBACK');
+      await deletePrivateProof(file.path).catch(() => {});
+      return res.status(409).json({ success: false, message: 'This transaction ID has already been submitted for this school' });
+    }
+
     const screenshotUrl = file.path;
 
     const { rows } = await client.query(
       `INSERT INTO fee_payment_requests 
-       (school_id, student_id, fee_id, transaction_id, screenshot_url, status, month, year, amount)
-       VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8)
+       (school_id, student_id, fee_id, transaction_id, screenshot_url, status, month, year, amount, transaction_key)
+       VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9)
        RETURNING *`,
-      [schoolId, studentId, fee_id ? Number(fee_id) : null, transaction_id.trim(), screenshotUrl, targetMonth, targetYear, targetAmount]
+      [schoolId, studentId, fee_id ? Number(fee_id) : null, transaction_id.trim(), screenshotUrl, targetMonth, targetYear, targetAmount, `${schoolId}:${normalizedTransaction}`]
     );
 
     // Update fee status to 'pending'
@@ -765,33 +1006,30 @@ async function createFeePaymentRequest(req, res) {
       [fee_id, studentId, schoolId]
     );
     await client.query('COMMIT');
+    committed = true;
 
-    // Invalidate dashboard cache
-    await del(`student:dashboard:${studentId}`);
-
-    const recipients = await pool.query(
-      `SELECT id FROM users
-       WHERE school_id = $1 AND role = 'admin'
-       UNION
-       SELECT u.id
-       FROM users u
-       JOIN fees f ON f.class_id = u.class_id AND f.id = $2
-       WHERE u.role = 'teacher' AND u.school_id = $1`,
-      [schoolId, fee_id]
-    );
-    const io = req.app.get('socketio');
-    await Promise.all(
-      recipients.rows.map((recipient) =>
-        createNotification(
-          recipient.id,
-          'New Fee Payment Submitted',
-          `Student submitted payment for ${targetMonth} ${targetYear} [requestId:${rows[0].id}] [feeId:${fee_id}] [tx:${transaction_id.trim()}]`,
-          'fee_payment_request',
-          rows[0].id,
-          io
-        )
-      )
-    );
+    try {
+      await del(`student:dashboard:${studentId}`);
+      const recipients = await pool.query(
+        `SELECT id FROM users
+         WHERE school_id = $1 AND role = 'admin'
+         UNION
+         SELECT u.id
+         FROM users u
+         JOIN fees f ON f.class_id = u.class_id AND f.id = $2 AND f.school_id = u.school_id
+         WHERE u.role = 'teacher' AND u.school_id = $1`,
+        [schoolId, fee_id]
+      );
+      const io = req.app.get('socketio');
+      await Promise.all(recipients.rows.map((recipient) => createNotification(
+        recipient.id,
+        'New Fee Payment Submitted',
+        `Student submitted payment for ${targetMonth} ${targetYear} [requestId:${rows[0].id}] [feeId:${fee_id}] [tx:${transaction_id.trim()}]`,
+        'fee_payment_request', rows[0].id, io
+      )));
+    } catch (notificationError) {
+      console.warn('Fee payment request notification failed:', notificationError.message);
+    }
 
     return res.status(201).json({
       success: true,
@@ -800,8 +1038,9 @@ async function createFeePaymentRequest(req, res) {
     });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (!committed) await deletePrivateProof(file.path).catch(() => {});
     if (error.code === '23505') {
-      return res.status(409).json({ success: false, message: 'A payment verification request is already pending for this month' });
+      return res.status(409).json({ success: false, message: 'This transaction ID was already used, or this fee already has a pending request' });
     }
     console.error('Create Fee Payment Request Error:', error);
     return res.status(500).json({ success: false, message: 'Failed to submit payment request' });
@@ -822,6 +1061,7 @@ async function listFeePaymentRequests(req, res) {
     const { rows } = await pool.query(
       `SELECT r.*,
               u.name AS student_name,
+              u.student_code,
               u.email AS student_email,
               c.name AS class_name,
               f.month AS fee_month,
@@ -829,9 +1069,9 @@ async function listFeePaymentRequests(req, res) {
               f.amount AS fee_amount
        FROM fee_payment_requests r
        JOIN users u ON u.id = r.student_id
-       LEFT JOIN classes c ON c.id = u.class_id
+       LEFT JOIN classes c ON c.id = u.class_id AND c.school_id = u.school_id
        LEFT JOIN fees f ON f.id = r.fee_id
-       WHERE COALESCE(r.school_id, u.school_id) = $1
+       WHERE u.school_id = $1 AND COALESCE(r.school_id, u.school_id) = $1
          AND ($3::integer IS NULL OR u.class_id = $3)
          AND ($2::text = 'all' OR r.status = $2)
        ORDER BY r.created_at DESC
@@ -842,6 +1082,48 @@ async function listFeePaymentRequests(req, res) {
   } catch (error) {
     console.error('List Fee Payment Requests Error:', error);
     return res.status(500).json({ success: false, message: 'Failed to load requests' });
+  }
+}
+
+async function getFeePaymentProofUrl(req, res) {
+  const requestId = Number(req.params.requestId);
+  const schoolId = req.user.school_id;
+  if (!Number.isInteger(requestId) || requestId < 1) {
+    return res.status(400).json({ success: false, message: 'Invalid payment request id' });
+  }
+
+  try {
+    const teacherClassId = req.user.role === 'teacher' ? await getTeacherClassId(req.user.id, schoolId) : null;
+    if (req.user.role === 'teacher' && !teacherClassId) {
+      return res.status(403).json({ success: false, message: 'Teacher is not assigned to a class' });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT r.screenshot_url, u.class_id
+       FROM fee_payment_requests r
+       JOIN users u ON u.id = r.student_id AND u.role = 'student'
+       WHERE r.id = $1 AND u.school_id = $2 AND COALESCE(r.school_id, u.school_id) = $2
+         AND ($3::integer IS NULL OR u.class_id = $3)
+       LIMIT 1`,
+      [requestId, schoolId, teacherClassId]
+    );
+    if (!rows.length || !rows[0].screenshot_url) {
+      return res.status(404).json({ success: false, message: 'Payment proof not found' });
+    }
+
+    const reference = rows[0].screenshot_url;
+    if (!reference.startsWith('private-storage://') && !reference.startsWith('private-local://')) {
+      if (!/^https:\/\//i.test(reference)) {
+        return res.status(404).json({ success: false, message: 'Payment proof is unavailable' });
+      }
+      return res.json({ success: true, url: reference, expires_in: null, legacy: true });
+    }
+
+    const url = await getPrivateProofSignedUrl(reference, 300);
+    return res.json({ success: true, url, expires_in: reference.startsWith('private-local://') ? null : 300, legacy: false });
+  } catch (error) {
+    console.error('Get fee proof URL error:', error);
+    return res.status(500).json({ success: false, message: 'Could not access payment proof' });
   }
 }
 
@@ -986,10 +1268,12 @@ const downloadFeeReceipt = async (req, res) => {
   try {
     const reqRes = await pool.query(
       `SELECT r.*, 
-              u.name AS student_name, u.email AS student_email,
+              u.name AS student_name, u.student_code, u.email AS student_email,
               c.name AS class_name, c.section,
               s.name AS school_name, s.logo_url AS school_logo_url,
-              f.amount AS fee_amount, f.due_date AS fee_due_date, f.status AS fee_status
+              f.amount AS fee_amount, f.base_amount AS fee_base_amount, f.fine_amount AS fee_fine_amount,
+              f.other_charges AS fee_other_charges, f.tax_rate AS fee_tax_rate, f.tax_amount AS fee_tax_amount,
+              f.discount_amount AS fee_discount_amount, f.due_date AS fee_due_date, f.status AS fee_status
        FROM fee_payment_requests r
        JOIN users u ON u.id = r.student_id
        LEFT JOIN classes c ON c.id = u.class_id
@@ -1017,9 +1301,9 @@ const downloadFeeReceipt = async (req, res) => {
 
     const pdfBuffer = await generateFeeReceiptPdf({
       school: { id: schoolId, name: payment.school_name, logo_url: payment.school_logo_url },
-      student: { id: payment.student_id, name: payment.student_name, email: payment.student_email, class_name: payment.class_name, section: payment.section },
-      payment: { id: payment.id, month: payment.month, year: payment.year, transaction_id: payment.transaction_id, created_at: payment.created_at, status: payment.status },
-      fee: { amount: payment.amount || payment.fee_amount, due_date: payment.fee_due_date, month: payment.month, year: payment.year, status: payment.fee_status }
+      student: { id: payment.student_id, student_code: payment.student_code, name: payment.student_name, email: payment.student_email, class_name: payment.class_name, section: payment.section },
+      payment: { id: payment.id, month: payment.month, year: payment.year, transaction_id: payment.transaction_id, payment_method: payment.payment_method, created_at: payment.created_at, status: payment.status },
+      fee: { amount: payment.amount || payment.fee_amount, base_amount: payment.fee_base_amount, fine_amount: payment.fee_fine_amount, other_charges: payment.fee_other_charges, tax_rate: payment.fee_tax_rate, tax_amount: payment.fee_tax_amount, discount_amount: payment.fee_discount_amount, due_date: payment.fee_due_date, month: payment.month, year: payment.year, status: payment.fee_status }
     });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -1037,6 +1321,9 @@ module.exports = {
   getEligibleMonths,
   getClassFees,
   createTeacherFeeProposal,
+  listFeeProposals,
+  reviewFeeProposal,
+  createTeacherCashStatusRequest,
   updateFeeStatus,
   editFee,
   uploadFees,
@@ -1045,8 +1332,12 @@ module.exports = {
   adminGenerateFees,
   getFeeStructure,
   saveFeeStructure,
+  saveStudentFeeAdjustment,
+  getStudentFeeAdjustment,
+  listFeeStudents,
   createFeePaymentRequest,
   listFeePaymentRequests,
+  getFeePaymentProofUrl,
   reviewFeePaymentRequest,
   sendMonthlyFeeReminders,
   downloadFeeReceipt

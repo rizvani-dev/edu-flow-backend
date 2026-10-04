@@ -41,8 +41,15 @@ if (!process.env.DATABASE_URL) {
   console.warn('⚠ DATABASE_URL is missing');
 }
 
+if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  if (process.env.NODE_ENV === 'production') {
+    console.warn('⚠ SUPABASE_SERVICE_ROLE_KEY is missing. Private fee proof uploads will fail in production.');
+  } else {
+    console.warn('⚠ SUPABASE_SERVICE_ROLE_KEY is missing. Fee proofs will be stored locally for development.');
+  }
+}
 if (!process.env.SUPABASE_SERVICE_ROLE_KEY && !process.env.SUPABASE_ANON_KEY) {
-  console.warn('⚠ Supabase storage key is missing. Uploads will fail.');
+  console.warn('⚠ Supabase storage key is missing. Supabase-backed uploads will fail.');
 }
 
 // ======================
@@ -159,6 +166,28 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // STATIC UPLOADS
 // ======================
 
+app.use('/uploads', (req, res, next) => {
+  let normalizedPath;
+  try {
+    normalizedPath = req.path;
+    for (let pass = 0; pass < 3; pass += 1) {
+      const decodedPath = decodeURIComponent(normalizedPath);
+      if (decodedPath === normalizedPath) break;
+      normalizedPath = decodedPath;
+    }
+    normalizedPath = path.posix.normalize(`/${normalizedPath.replace(/\\/g, '/')}`);
+  } catch {
+    return res.status(400).end();
+  }
+
+  const firstSegment = normalizedPath.split('/').filter(Boolean)[0]?.toLowerCase();
+  if (['backups', 'salaries', 'subscriptions', 'temp'].includes(firstSegment)) {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(404).json({ success: false, message: 'File not found' });
+  }
+  return next();
+});
+
 app.use(
   '/uploads',
   express.static(path.join(__dirname, 'uploads'), {
@@ -223,7 +252,7 @@ io.use(async (socket, next) => {
     if (!token || !process.env.JWT_SECRET) return next(new Error('Unauthorized'));
     const claims = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
     const { rows } = await pool.query(
-      'SELECT id, role, class_id, school_id FROM users WHERE id = $1 AND role = $2 AND school_id IS NOT DISTINCT FROM $3',
+      'SELECT id, role, class_id, teacher_id, school_id FROM users WHERE id = $1 AND role = $2 AND school_id IS NOT DISTINCT FROM $3',
       [claims.id, claims.role, claims.school_id ?? null]
     );
     if (!rows[0]) return next(new Error('Unauthorized'));
@@ -691,6 +720,25 @@ server.listen(PORT, async () => {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_fee_structures_school_class ON fee_structures(school_id, class_id)`);
 
     // 3. Teacher Salaries breakdown and timestamps
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS teacher_salary_requests (
+        id SERIAL PRIMARY KEY,
+        school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+        teacher_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        month VARCHAR(20) NOT NULL,
+        year INTEGER NOT NULL,
+        amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+        request_type VARCHAR(20) NOT NULL DEFAULT 'salary' CHECK (request_type IN ('salary', 'advance', 'correction')),
+        reason TEXT NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+        admin_response TEXT,
+        reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        reviewed_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_salary_requests_school_status ON teacher_salary_requests(school_id, status, created_at DESC)`);
+
     await pool.query(`
       ALTER TABLE teacher_salaries
       ADD COLUMN IF NOT EXISTS basic_salary NUMERIC(12,2) DEFAULT 0,

@@ -49,6 +49,7 @@ temp/
 # Uploads
 uploads/
 public/uploads/
+private-uploads/
 
 # Database files
 *.sqlite

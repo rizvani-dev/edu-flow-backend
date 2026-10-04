@@ -89,6 +89,23 @@ const getChatPermission = async (currentUserId, targetUserId) => {
   };
 };
 
+const getSchoolAdmins = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, email, profile_image, bio, online, last_seen
+       FROM users WHERE role = 'admin' AND school_id = $1 ORDER BY name`,
+      [req.user.school_id]
+    );
+    return res.json({ success: true, admins: rows.map((admin) => ({
+      ...admin,
+      profile_image: normalizeStoredMediaPath(admin.profile_image),
+    })) });
+  } catch (error) {
+    console.error('Get School Admin Contacts Error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load school administrators' });
+  }
+};
+
 const getConversationMessages = async (req, res) => {
   const currentUserId = req.user.id;
   const targetUserId = Number(req.params.userId);
@@ -262,6 +279,7 @@ const sendConversationMessage = async (req, res) => {
 };
 
 module.exports = {
+  getSchoolAdmins,
   getConversationMessages,
   sendConversationMessage,
 };

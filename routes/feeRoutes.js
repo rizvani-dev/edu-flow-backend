@@ -1,13 +1,16 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const { uploadDoc } = require('../middleware/storageUpload');
+const { uploadFeeProof } = require('../middleware/storageUpload');
 const { 
   getStudentFees,
   getCurrentFee,
   getEligibleMonths,
   getClassFees, 
   createTeacherFeeProposal,
+  listFeeProposals,
+  reviewFeeProposal,
+  createTeacherCashStatusRequest,
   updateFeeStatus, 
   editFee,
   uploadFees,
@@ -16,8 +19,12 @@ const {
   adminGenerateFees,
   getFeeStructure,
   saveFeeStructure,
+  saveStudentFeeAdjustment,
+  getStudentFeeAdjustment,
+  listFeeStudents,
   createFeePaymentRequest,
   listFeePaymentRequests,
+  getFeePaymentProofUrl,
   reviewFeePaymentRequest,
   sendMonthlyFeeReminders,
   downloadFeeReceipt
@@ -35,24 +42,31 @@ router.use(authenticateToken);
 router.get('/my-fees', checkRole(['student']), getStudentFees);
 router.get('/current', checkRole(['student']), getCurrentFee);
 router.get('/eligible-months', checkRole(['student']), getEligibleMonths);
-router.post('/payment-requests', checkRole(['student']), uploadDoc.single('screenshot'), createFeePaymentRequest);
+router.post('/payment-requests', checkRole(['student']), uploadFeeProof.single('screenshot'), createFeePaymentRequest);
 router.get('/payment-requests/:requestId/receipt', checkRole(['student', 'admin']), downloadFeeReceipt);
+router.get('/payment-requests/:requestId/proof', checkRole(['admin', 'teacher']), getFeePaymentProofUrl);
 
 // Teacher routes
 router.get('/class-fees', checkRole(['teacher']), getClassFees);
 router.post('/proposals', checkRole(['teacher']), createTeacherFeeProposal);
+router.post('/teacher-status-requests', checkRole(['teacher']), createTeacherCashStatusRequest);
 router.get('/stats', checkRole(['teacher']), getFeeStats);
 router.post('/reminders', checkRole(['teacher', 'admin']), sendMonthlyFeeReminders);
 
 // Admin routes
 router.post('/generate', checkRole(['admin']), adminGenerateFees);
+router.get('/proposals/pending', checkRole(['admin']), listFeeProposals);
+router.put('/proposals/:proposalId/review', checkRole(['admin']), reviewFeeProposal);
 router.get('/structure', checkRole(['admin']), getFeeStructure);
 router.post('/structure', checkRole(['admin']), saveFeeStructure);
+router.get('/student-adjustments/:studentId', checkRole(['admin']), getStudentFeeAdjustment);
+router.put('/student-adjustments', checkRole(['admin']), saveStudentFeeAdjustment);
+router.get('/students', checkRole(['admin']), listFeeStudents);
 router.put('/update/:feeId', checkRole(['admin']), updateFeeStatus);
 router.put('/edit/:feeId', checkRole(['admin']), editFee);
 router.post('/upload', checkRole(['admin']), excelUpload.single('file'), uploadFees);
 router.delete('/:feeId', checkRole(['admin']), deleteFee);
 router.get('/payment-requests', checkRole(['admin', 'teacher']), listFeePaymentRequests);
-router.put('/payment-requests/:requestId', checkRole(['admin', 'teacher']), reviewFeePaymentRequest);
+router.put('/payment-requests/:requestId', checkRole(['admin']), reviewFeePaymentRequest);
 
 module.exports = router;

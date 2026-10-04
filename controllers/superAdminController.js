@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const bcrypt = require('bcryptjs');
 const fs = require('fs');
+const crypto = require('crypto');
 const { createNotification } = require('./notificationController');
 const { mapMediaFieldsList } = require('../utils/media');
 const { del, withCache } = require('../services/cacheService');
@@ -18,6 +19,8 @@ const readBackupUpload = async (file) => {
 const getBackupTableNames = (backupData) =>
   Object.keys(backupData || {}).filter((tableName) => Array.isArray(backupData[tableName]));
 
+const quoteIdentifier = (identifier) => `"${String(identifier).replace(/"/g, '""')}"`;
+
 const buildUpsertClause = (columns) => {
   const updatableColumns = columns.filter((column) => column !== 'id');
   if (!updatableColumns.length) {
@@ -25,7 +28,7 @@ const buildUpsertClause = (columns) => {
   }
 
   return `ON CONFLICT (id) DO UPDATE SET ${updatableColumns
-    .map((column) => `"${column}" = EXCLUDED."${column}"`)
+    .map((column) => `${quoteIdentifier(column)} = EXCLUDED.${quoteIdentifier(column)}`)
     .join(', ')}`;
 };
 
@@ -33,14 +36,14 @@ const insertRecords = async (client, tableName, records) => {
   if (!Array.isArray(records) || records.length === 0) return;
 
   const columns = Object.keys(records[0]);
-  const columnNames = columns.map((col) => `"${col}"`).join(', ');
+  const columnNames = columns.map(quoteIdentifier).join(', ');
   const valuePlaceholders = columns.map((_, i) => `$${i + 1}`).join(', ');
   const upsertClause = buildUpsertClause(columns);
 
   for (const record of records) {
     const values = columns.map((col) => record[col]);
     await client.query(
-      `INSERT INTO "${tableName}" (${columnNames}) VALUES (${valuePlaceholders}) ${upsertClause};`,
+      `INSERT INTO ${quoteIdentifier(tableName)} (${columnNames}) VALUES (${valuePlaceholders}) ${upsertClause};`,
       values
     );
   }
@@ -75,8 +78,8 @@ const getSchoolAdmin = async (schoolId) => {
   return rows[0]?.id || null;
 };
 
-const getDurationEndDate = (duration) => {
-  const now = new Date();
+const getDurationEndDate = (duration, startsAt = new Date()) => {
+  const now = new Date(startsAt);
   switch (duration) {
     case '15days':
       now.setDate(now.getDate() + 15);
@@ -210,6 +213,10 @@ const reviewSubscriptionRequest = async (req, res) => {
     const request = requestRes.rows[0];
     const reviewedAt = new Date();
 
+    if (request.status !== 'pending') {
+      return res.status(409).json({ success: false, message: 'This subscription request has already been reviewed' });
+    }
+
     // Verify the reviewer (Super Admin) exists in the users table to prevent FK violation (Error 23503)
     // This can happen if a full restore was performed and the current session ID is no longer in the DB.
     const reviewerCheck = await pool.query('SELECT id FROM users WHERE id = $1', [req.user.id]);
@@ -218,12 +225,20 @@ const reviewSubscriptionRequest = async (req, res) => {
     const { rows: updatedRequest } = await pool.query(
       `UPDATE subscription_requests
        SET status = $1, remarks = $2, reviewed_by = $3, reviewed_at = $4
-       WHERE id = $5 RETURNING *`,
+       WHERE id = $5 AND status = 'pending' RETURNING *`,
       [status, remarks || null, reviewerId, reviewedAt, requestId]
     );
 
+    if (!updatedRequest.length) {
+      return res.status(409).json({ success: false, message: 'This subscription request has already been reviewed' });
+    }
+
+    let expiresAt = null;
     if (status === 'approved') {
-      const expiresAt = getDurationEndDate(request.duration);
+      const schoolRes = await pool.query('SELECT subscription_expires_at FROM schools WHERE id = $1', [request.school_id]);
+      const currentExpiry = schoolRes.rows[0]?.subscription_expires_at;
+      const startDate = currentExpiry && new Date(currentExpiry) > reviewedAt ? currentExpiry : reviewedAt;
+      expiresAt = getDurationEndDate(request.duration, startDate);
       await pool.query(
         `UPDATE schools
          SET subscription_status = 'active', subscription_plan = $1, subscription_price = $2, subscription_expires_at = $3, subscription_paused = false, updated_at = NOW()
@@ -234,7 +249,7 @@ const reviewSubscriptionRequest = async (req, res) => {
 
     const adminId = await getSchoolAdmin(request.school_id);
     const message = status === 'approved'
-      ? `Your subscription request for ${request.duration} was approved. Access extended until ${getDurationEndDate(request.duration).toLocaleDateString()}.`
+      ? `Your subscription request for ${request.duration} was approved. Access extended until ${expiresAt.toLocaleDateString()}.`
       : `Your subscription request for ${request.duration} was rejected. ${remarks || ''}`;
 
     if (adminId) {
@@ -512,6 +527,7 @@ const exportFullBackup = async (req, res) => {
 
     client.release();
 
+    res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('Content-Disposition', `attachment; filename="full_system_backup_${new Date().toISOString().split('T')[0]}.json"`);
     res.setHeader('Content-Type', 'application/json');
     res.status(200).send(JSON.stringify(backupData, null, 2));
@@ -554,6 +570,7 @@ const exportSchoolBackup = async (req, res) => {
 
     client.release();
 
+    res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('Content-Disposition', `attachment; filename="school_${schoolId}_backup_${new Date().toISOString().split('T')[0]}.json"`);
     res.setHeader('Content-Type', 'application/json');
     res.status(200).send(JSON.stringify(backupData, null, 2));
@@ -563,11 +580,17 @@ const exportSchoolBackup = async (req, res) => {
   }
 };
 
-const MASTER_DELETE_KEY = process.env.MASTER_DELETE_KEY || 'edu-flow-master-key';
+const MASTER_DELETE_KEY = process.env.MASTER_DELETE_KEY || '';
+const isValidMasterKey = (candidate) => {
+  if (!MASTER_DELETE_KEY || typeof candidate !== 'string') return false;
+  const expected = Buffer.from(MASTER_DELETE_KEY, 'utf8');
+  const supplied = Buffer.from(candidate, 'utf8');
+  return expected.length === supplied.length && crypto.timingSafeEqual(expected, supplied);
+};
 
 const importFullBackup = async (req, res) => {
   const { masterKey } = req.body;
-  if (masterKey !== MASTER_DELETE_KEY) {
+  if (!isValidMasterKey(masterKey)) {
     return res.status(403).json({ success: false, message: "Unauthorized: Invalid Master Key for full system restore." });
   }
 
@@ -627,7 +650,7 @@ const importSchoolBackup = async (req, res) => {
   const { schoolId } = req.params;
   const { masterKey } = req.body;
 
-  if (masterKey !== MASTER_DELETE_KEY) {
+  if (!isValidMasterKey(masterKey)) {
     return res.status(403).json({ success: false, message: "Unauthorized: Invalid Master Key for school restore." });
   }
 

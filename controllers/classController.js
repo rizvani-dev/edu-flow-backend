@@ -17,7 +17,7 @@ const getClasses = async (req, res) => {
         t.name AS teacher_name,
         COUNT(u.id) FILTER (WHERE u.role = 'student')::int AS student_count
       FROM classes c
-      LEFT JOIN users t ON t.id = c.teacher_id
+      LEFT JOIN users t ON t.id = c.teacher_id AND t.school_id = c.school_id AND t.role = 'teacher'
       LEFT JOIN users u ON u.class_id = c.id AND u.school_id = c.school_id
       WHERE c.school_id = $1
       GROUP BY c.id, t.name

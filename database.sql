@@ -1,257 +1,383 @@
--- Baseline schema for a new database only.
--- This file must never drop production tables. Apply forward-only migrations to
--- existing environments and take a tested backup before every schema change.
+-- WARNING: This schema is for context only and is not meant to be run.
+-- Table order and constraints may not be valid for execution.
 
--- Schools Table (Tenants)
-CREATE TABLE schools (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    subdomain VARCHAR(100) UNIQUE,
-    logo_url TEXT,
-    subscription_plan VARCHAR(50) DEFAULT 'none',
-    subscription_price NUMERIC(12, 2) DEFAULT 0,
-    subscription_status VARCHAR(20) DEFAULT 'inactive' CHECK (subscription_status IN ('inactive', 'active', 'paused', 'expired')),
-    subscription_expires_at TIMESTAMP,
-    subscription_paused BOOLEAN DEFAULT false,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE public.schools (
+  id integer NOT NULL DEFAULT nextval('schools_id_seq'::regclass),
+  name character varying NOT NULL,
+  subdomain character varying UNIQUE,
+  logo_url text,
+  subscription_plan character varying DEFAULT 'none'::character varying,
+  subscription_price numeric DEFAULT 0,
+  subscription_status character varying DEFAULT 'inactive'::character varying CHECK (subscription_status::text = ANY (ARRAY['inactive'::character varying, 'active'::character varying, 'paused'::character varying, 'expired'::character varying]::text[])),
+  subscription_expires_at timestamp without time zone,
+  subscription_paused boolean DEFAULT false,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp without time zone,
+  CONSTRAINT schools_pkey PRIMARY KEY (id)
 );
-
--- Users Table
-CREATE TABLE users (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(100) NOT NULL,
-    email VARCHAR(100) UNIQUE NOT NULL,
-    password VARCHAR(255) NOT NULL,
-    role VARCHAR(20) NOT NULL CHECK (role IN ('admin', 'teacher', 'student', 'super_admin')),
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE, -- NULL for super_admin
-    class_id INTEGER,
-    teacher_id INTEGER,
-    bio TEXT,
-    profile_image TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    online BOOLEAN DEFAULT false,
-    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE public.users (
+  id integer NOT NULL DEFAULT nextval('users_id_seq'::regclass),
+  student_code character varying,
+  name character varying NOT NULL,
+  email character varying NOT NULL UNIQUE,
+  password character varying NOT NULL,
+  role character varying NOT NULL CHECK (role::text = ANY (ARRAY['admin'::character varying, 'teacher'::character varying, 'student'::character varying, 'super_admin'::character varying]::text[])),
+  school_id integer,
+  class_id integer,
+  teacher_id integer,
+  bio text,
+  profile_image text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  online boolean DEFAULT false,
+  last_seen timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT users_pkey PRIMARY KEY (id),
+  CONSTRAINT users_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT fk_user_class FOREIGN KEY (class_id) REFERENCES public.classes(id),
+  CONSTRAINT fk_user_teacher FOREIGN KEY (teacher_id) REFERENCES public.users(id)
 );
-
-CREATE TABLE teacher_salaries (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    teacher_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    month VARCHAR(20) NOT NULL,
-    year INTEGER NOT NULL,
-    amount NUMERIC(12, 2) NOT NULL,
-    status VARCHAR(20) DEFAULT 'pending', -- 'pending' or 'paid'
-    payment_screenshot TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE public.login_sessions (
+  id uuid PRIMARY KEY,
+  user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  device_label character varying(120) NOT NULL DEFAULT 'Web browser',
+  user_agent character varying(500),
+  ip_address inet,
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_seen_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-
--- Classes Table
-CREATE TABLE classes (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    name VARCHAR(50) NOT NULL,
-    grade_level INTEGER NOT NULL DEFAULT 1,
-    section VARCHAR(10) NOT NULL DEFAULT 'A',
-    teacher_id INTEGER REFERENCES users(id) ON DELETE SET NULL
+CREATE TABLE public.teacher_salaries (
+  id integer NOT NULL DEFAULT nextval('teacher_salaries_id_seq'::regclass),
+  school_id integer,
+  teacher_id integer,
+  month character varying NOT NULL,
+  year integer NOT NULL,
+  amount numeric NOT NULL,
+  amount_paid numeric NOT NULL DEFAULT 0,
+  status character varying DEFAULT 'pending'::character varying,
+  payment_screenshot text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  basic_salary numeric DEFAULT 0,
+  allowances numeric DEFAULT 0,
+  bonus numeric DEFAULT 0,
+  overtime numeric DEFAULT 0,
+  deductions numeric DEFAULT 0,
+  advance numeric DEFAULT 0,
+  fine numeric DEFAULT 0,
+  remarks text,
+  approved_by integer,
+  approved_at timestamp without time zone,
+  paid_at timestamp without time zone,
+  rejected_at timestamp without time zone,
+  rejection_reason text,
+  CONSTRAINT teacher_salaries_pkey PRIMARY KEY (id),
+  CONSTRAINT teacher_salaries_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT teacher_salaries_teacher_id_fkey FOREIGN KEY (teacher_id) REFERENCES public.users(id),
+  CONSTRAINT teacher_salaries_approved_by_fkey FOREIGN KEY (approved_by) REFERENCES public.users(id)
 );
-
-ALTER TABLE classes
-ADD CONSTRAINT unique_school_grade_section UNIQUE (school_id, grade_level, section);
-
--- Add missing foreign keys after both tables exist
-ALTER TABLE users
-ADD CONSTRAINT fk_user_class FOREIGN KEY (class_id) REFERENCES classes(id) ON DELETE SET NULL;
-
-ALTER TABLE users
-ADD CONSTRAINT fk_user_teacher FOREIGN KEY (teacher_id) REFERENCES users(id) ON DELETE SET NULL;
-
--- Attendance Table
-CREATE TABLE attendance (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    teacher_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    class_id INTEGER REFERENCES classes(id) ON DELETE SET NULL,
-    date DATE NOT NULL,
-    status VARCHAR(20) NOT NULL CHECK (status IN ('present', 'absent', 'late', 'holiday')),
-    remarks TEXT,
-    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (student_id, date)
+CREATE TABLE public.teacher_salary_requests (
+  id integer NOT NULL DEFAULT nextval('teacher_salary_requests_id_seq'::regclass),
+  school_id integer NOT NULL REFERENCES public.schools(id) ON DELETE CASCADE,
+  teacher_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  month character varying NOT NULL,
+  year integer NOT NULL,
+  amount numeric(12,2) NOT NULL CHECK (amount > 0),
+  advance_percentage numeric(5,2),
+  request_type character varying NOT NULL DEFAULT 'salary' CHECK (request_type IN ('salary', 'advance', 'correction')),
+  reason text NOT NULL,
+  status character varying NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  admin_response text,
+  reviewed_by integer REFERENCES public.users(id) ON DELETE SET NULL,
+  reviewed_at timestamp without time zone,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT teacher_salary_requests_pkey PRIMARY KEY (id)
 );
-
--- Results Table
-CREATE TABLE results (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    teacher_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    class_id INTEGER REFERENCES classes(id) ON DELETE SET NULL,
-    subject VARCHAR(50) NOT NULL,
-    marks INTEGER CHECK (marks >= 0 AND marks <= 100),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE public.teacher_salary_advances (
+  id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  request_id integer NOT NULL UNIQUE REFERENCES public.teacher_salary_requests(id) ON DELETE CASCADE,
+  school_id integer NOT NULL REFERENCES public.schools(id) ON DELETE CASCADE,
+  teacher_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  amount numeric(12,2) NOT NULL CHECK (amount > 0),
+  deduction_month character varying(20) NOT NULL,
+  deduction_year integer NOT NULL,
+  remarks text,
+  status character varying(20) NOT NULL DEFAULT 'approved' CHECK (status IN ('approved', 'applied')),
+  salary_id integer REFERENCES public.teacher_salaries(id) ON DELETE SET NULL,
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-
--- Announcements Table
-CREATE TABLE announcements (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    title VARCHAR(200) NOT NULL,
-    description TEXT NOT NULL,
-    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    target_role VARCHAR(20) CHECK (target_role IN ('all', 'teacher', 'student', 'my_class')),
-    date DATE DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE public.classes (
+  id integer NOT NULL DEFAULT nextval('classes_id_seq'::regclass),
+  school_id integer,
+  name character varying NOT NULL,
+  grade_level integer NOT NULL DEFAULT 1,
+  section character varying NOT NULL DEFAULT 'A'::character varying,
+  teacher_id integer,
+  CONSTRAINT classes_pkey PRIMARY KEY (id),
+  CONSTRAINT classes_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT classes_teacher_id_fkey FOREIGN KEY (teacher_id) REFERENCES public.users(id)
 );
-
--- Fees Table
-CREATE TABLE fees (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    class_id INTEGER REFERENCES classes(id) ON DELETE SET NULL,
-    month VARCHAR(20) NOT NULL,
-    year INTEGER NOT NULL,
-    amount DECIMAL(10, 2) NOT NULL,
-    status VARCHAR(20) DEFAULT 'unpaid' CHECK (status IN ('unpaid', 'pending', 'paid', 'partial', 'overdue', 'rejected')),
-    due_date DATE,
-    remarks TEXT,
-    updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (student_id, month, year)
+CREATE TABLE public.attendance (
+  id integer NOT NULL DEFAULT nextval('attendance_id_seq'::regclass),
+  school_id integer,
+  student_id integer,
+  teacher_id integer,
+  class_id integer,
+  date date NOT NULL,
+  status character varying NOT NULL CHECK (status::text = ANY (ARRAY['present'::character varying, 'absent'::character varying, 'late'::character varying, 'holiday'::character varying]::text[])),
+  remarks text,
+  created_by integer,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT attendance_pkey PRIMARY KEY (id),
+  CONSTRAINT attendance_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT attendance_student_id_fkey FOREIGN KEY (student_id) REFERENCES public.users(id),
+  CONSTRAINT attendance_teacher_id_fkey FOREIGN KEY (teacher_id) REFERENCES public.users(id),
+  CONSTRAINT attendance_class_id_fkey FOREIGN KEY (class_id) REFERENCES public.classes(id),
+  CONSTRAINT attendance_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id)
 );
-
--- Manual Fee Payment Requests (Student uploads screenshot + transaction id)
-CREATE TABLE fee_payment_requests (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    fee_id INTEGER REFERENCES fees(id) ON DELETE SET NULL,
-    transaction_id VARCHAR(120) NOT NULL,
-    screenshot_url TEXT,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
-    remarks TEXT,
-    reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    reviewed_at TIMESTAMP,
-    month VARCHAR(20),
-    year INTEGER,
-    amount NUMERIC(12,2),
-    approved_at TIMESTAMP,
-    rejected_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE public.results (
+  id integer NOT NULL DEFAULT nextval('results_id_seq'::regclass),
+  school_id integer,
+  student_id integer,
+  teacher_id integer,
+  class_id integer,
+  subject character varying NOT NULL,
+  marks integer CHECK (marks >= 0 AND marks <= 100),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT results_pkey PRIMARY KEY (id),
+  CONSTRAINT results_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT results_student_id_fkey FOREIGN KEY (student_id) REFERENCES public.users(id),
+  CONSTRAINT results_teacher_id_fkey FOREIGN KEY (teacher_id) REFERENCES public.users(id),
+  CONSTRAINT results_class_id_fkey FOREIGN KEY (class_id) REFERENCES public.classes(id)
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_fee_request_pending
-ON fee_payment_requests(student_id, fee_id)
-WHERE status = 'pending' AND fee_id IS NOT NULL;
-
-CREATE TABLE fee_structures (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    class_id INTEGER REFERENCES classes(id) ON DELETE CASCADE,
-    monthly_fee NUMERIC(12, 2) NOT NULL CHECK (monthly_fee >= 0),
-    effective_from DATE NOT NULL DEFAULT CURRENT_DATE,
-    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (school_id, class_id)
+CREATE TABLE public.announcements (
+  id integer NOT NULL DEFAULT nextval('announcements_id_seq'::regclass),
+  school_id integer,
+  title character varying NOT NULL,
+  description text NOT NULL,
+  created_by integer,
+  target_role character varying CHECK (target_role::text = ANY (ARRAY['all'::character varying, 'teacher'::character varying, 'student'::character varying, 'my_class'::character varying]::text[])),
+  date date DEFAULT CURRENT_TIMESTAMP,
+  reactions jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT announcements_pkey PRIMARY KEY (id),
+  CONSTRAINT announcements_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT announcements_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id)
 );
-
-CREATE INDEX idx_fee_structures_school_class ON fee_structures (school_id, class_id);
-
--- Subscription Request Table
-CREATE TABLE subscription_requests (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    duration VARCHAR(20) NOT NULL,
-    price NUMERIC(12, 2) NOT NULL,
-    screenshot_url TEXT,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
-    remarks TEXT,
-    reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    reviewed_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE public.fees (
+  id integer NOT NULL DEFAULT nextval('fees_id_seq'::regclass),
+  school_id integer,
+  student_id integer,
+  class_id integer,
+  month character varying NOT NULL,
+  year integer NOT NULL,
+  amount numeric NOT NULL,
+  status character varying DEFAULT 'pending'::character varying CHECK (status::text = ANY (ARRAY['unpaid'::character varying, 'pending'::character varying, 'paid'::character varying, 'partial'::character varying, 'overdue'::character varying, 'rejected'::character varying]::text[])),
+  due_date date,
+  remarks text,
+  updated_by integer,
+  updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  fine_amount numeric NOT NULL DEFAULT 0 CHECK (fine_amount >= 0::numeric),
+  other_charges numeric NOT NULL DEFAULT 0 CHECK (other_charges >= 0::numeric),
+  base_amount numeric NOT NULL DEFAULT 0,
+  tax_rate numeric NOT NULL DEFAULT 0 CHECK (tax_rate >= 0 AND tax_rate <= 100),
+  tax_amount numeric NOT NULL DEFAULT 0 CHECK (tax_amount >= 0),
+  discount_amount numeric NOT NULL DEFAULT 0 CHECK (discount_amount >= 0),
+  CONSTRAINT fees_pkey PRIMARY KEY (id),
+  CONSTRAINT fees_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT fees_student_id_fkey FOREIGN KEY (student_id) REFERENCES public.users(id),
+  CONSTRAINT fees_class_id_fkey FOREIGN KEY (class_id) REFERENCES public.classes(id),
+  CONSTRAINT fees_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id)
 );
-
--- Online Exams Table (AI Generated)
-CREATE TABLE exams (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    teacher_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    class_id INTEGER REFERENCES classes(id) ON DELETE CASCADE,
-    title VARCHAR(255) NOT NULL,
-    subject VARCHAR(120),
-    difficulty VARCHAR(20) CHECK (difficulty IN ('Easy', 'Medium', 'Hard')),
-    total_questions INTEGER DEFAULT 10,
-    marks INTEGER DEFAULT 100,
-    duration_minutes INTEGER DEFAULT 30,
-    questions JSONB, -- Stores the AI-generated question structure
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE public.fee_payment_requests (
+  id integer NOT NULL DEFAULT nextval('fee_payment_requests_id_seq'::regclass),
+  school_id integer,
+  student_id integer,
+  fee_id integer,
+  transaction_id character varying NOT NULL,
+  screenshot_url text,
+  status character varying NOT NULL DEFAULT 'pending'::character varying CHECK (status::text = ANY (ARRAY['pending'::character varying, 'approved'::character varying, 'rejected'::character varying]::text[])),
+  remarks text,
+  reviewed_by integer,
+  reviewed_at timestamp without time zone,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  month character varying,
+  year integer,
+  amount numeric,
+  approved_at timestamp without time zone,
+  rejected_at timestamp without time zone,
+  payment_method character varying NOT NULL DEFAULT 'online'::character varying CHECK (payment_method::text = ANY (ARRAY['online'::character varying, 'cash'::character varying]::text[])),
+  transaction_key text,
+  CONSTRAINT fee_payment_requests_pkey PRIMARY KEY (id),
+  CONSTRAINT fee_payment_requests_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT fee_payment_requests_student_id_fkey FOREIGN KEY (student_id) REFERENCES public.users(id),
+  CONSTRAINT fee_payment_requests_fee_id_fkey FOREIGN KEY (fee_id) REFERENCES public.fees(id),
+  CONSTRAINT fee_payment_requests_reviewed_by_fkey FOREIGN KEY (reviewed_by) REFERENCES public.users(id)
 );
-
--- Exam Results (Student Submissions)
-CREATE TABLE exam_results (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    exam_id INTEGER REFERENCES exams(id) ON DELETE CASCADE,
-    student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    score INTEGER CHECK (score >= 0 AND score <= 500),
-    answers JSONB, -- Stores student's responses
-    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (exam_id, student_id) -- Prevents multiple submissions for the same exam
+CREATE TABLE public.subscription_requests (
+  id integer NOT NULL DEFAULT nextval('subscription_requests_id_seq'::regclass),
+  school_id integer,
+  admin_id integer,
+  duration character varying NOT NULL,
+  price numeric NOT NULL,
+  screenshot_url text,
+  status character varying NOT NULL DEFAULT 'pending'::character varying CHECK (status::text = ANY (ARRAY['pending'::character varying, 'approved'::character varying, 'rejected'::character varying]::text[])),
+  remarks text,
+  reviewed_by integer,
+  reviewed_at timestamp without time zone,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT subscription_requests_pkey PRIMARY KEY (id),
+  CONSTRAINT subscription_requests_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT subscription_requests_admin_id_fkey FOREIGN KEY (admin_id) REFERENCES public.users(id),
+  CONSTRAINT subscription_requests_reviewed_by_fkey FOREIGN KEY (reviewed_by) REFERENCES public.users(id)
 );
-
--- Messages Table
-CREATE TABLE messages (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    message TEXT,
-    file_url TEXT,
-    file_name TEXT,
-    file_mime TEXT,
-    file_size INTEGER,
-    message_type VARCHAR(20) NOT NULL DEFAULT 'text' CHECK (message_type IN ('text', 'image', 'video', 'audio', 'file')),
-    reactions JSONB NOT NULL DEFAULT '{}'::jsonb,
-    deleted_for INTEGER[] NOT NULL DEFAULT '{}'::int[],
-    deleted_for_everyone BOOLEAN NOT NULL DEFAULT false,
-    seen_at TIMESTAMP,
-    status VARCHAR(20) NOT NULL DEFAULT 'sent' CHECK (status IN ('sent', 'seen', 'deleted')),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE public.messages (
+  id integer NOT NULL DEFAULT nextval('messages_id_seq'::regclass),
+  school_id integer,
+  sender_id integer,
+  receiver_id integer,
+  message text,
+  file_url text,
+  file_name text,
+  file_mime text,
+  file_size integer,
+  message_type character varying NOT NULL DEFAULT 'text'::character varying CHECK (message_type::text = ANY (ARRAY['text'::character varying, 'image'::character varying, 'video'::character varying, 'audio'::character varying, 'file'::character varying]::text[])),
+  reactions jsonb NOT NULL DEFAULT '{}'::jsonb,
+  deleted_for ARRAY NOT NULL DEFAULT '{}'::integer[],
+  deleted_for_everyone boolean NOT NULL DEFAULT false,
+  seen_at timestamp without time zone,
+  status character varying NOT NULL DEFAULT 'sent'::character varying CHECK (status::text = ANY (ARRAY['sent'::character varying, 'seen'::character varying, 'deleted'::character varying]::text[])),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  updated_at bigint,
+  CONSTRAINT messages_pkey PRIMARY KEY (id),
+  CONSTRAINT messages_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT messages_sender_id_fkey FOREIGN KEY (sender_id) REFERENCES public.users(id),
+  CONSTRAINT messages_receiver_id_fkey FOREIGN KEY (receiver_id) REFERENCES public.users(id)
 );
-
--- Notifications Table
-CREATE TABLE notifications (
-    id SERIAL PRIMARY KEY,
-    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    title VARCHAR(200) NOT NULL,
-    message TEXT NOT NULL,
-    type VARCHAR(30) NOT NULL DEFAULT 'info',
-    is_read BOOLEAN DEFAULT false,
-    related_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE public.notifications (
+  id integer NOT NULL DEFAULT nextval('notifications_id_seq'::regclass),
+  school_id integer,
+  user_id integer,
+  title character varying NOT NULL,
+  message text NOT NULL,
+  type character varying NOT NULL DEFAULT 'info'::character varying,
+  is_read boolean DEFAULT false,
+  related_user_id integer,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT notifications_pkey PRIMARY KEY (id),
+  CONSTRAINT notifications_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id),
+  CONSTRAINT notifications_related_user_id_fkey FOREIGN KEY (related_user_id) REFERENCES public.users(id)
 );
-
-CREATE INDEX idx_users_school_role ON users (school_id, role);
-CREATE INDEX idx_users_school_id ON users (school_id);
-CREATE INDEX idx_users_class_id ON users (class_id);
-CREATE INDEX idx_attendance_school_student ON attendance (school_id, student_id, date DESC);
-CREATE INDEX idx_results_school_student ON results (school_id, student_id, created_at DESC);
-CREATE INDEX idx_attendance_school_class_date ON attendance (school_id, class_id, date DESC);
-CREATE INDEX idx_results_school_class_subject ON results (school_id, class_id, subject);
-CREATE INDEX idx_exams_class_id ON exams (class_id);
-CREATE INDEX idx_exam_results_student_id ON exam_results (student_id);
-CREATE INDEX idx_fees_school_student ON fees (school_id, student_id, year DESC, month);
-CREATE INDEX idx_fee_payment_requests_school_student ON fee_payment_requests (school_id, student_id, created_at DESC);
-CREATE INDEX idx_messages_sender_receiver_created ON messages (sender_id, receiver_id, created_at DESC, id DESC);
-CREATE INDEX idx_messages_receiver_status ON messages (receiver_id, status, created_at DESC);
-CREATE INDEX idx_notifications_user_created ON notifications (user_id, created_at DESC);
-CREATE INDEX idx_subscription_requests_status_created ON subscription_requests (status, created_at DESC);
-CREATE INDEX idx_schools_created_at ON schools (created_at DESC);
-
--- Do not seed a known privileged password. Create the initial super administrator
--- through a controlled deployment migration or the database console with a unique,
--- bcrypt-hashed password stored in the team's secret manager.
-SELECT 'Database tables created. No default privileged account was seeded.' AS message;
+CREATE TABLE public.exams (
+  id integer NOT NULL DEFAULT nextval('exams_id_seq'::regclass),
+  school_id integer,
+  teacher_id integer,
+  class_id integer,
+  title character varying NOT NULL,
+  subject character varying,
+  difficulty character varying CHECK (difficulty::text = ANY (ARRAY['Easy'::character varying, 'Medium'::character varying, 'Hard'::character varying]::text[])),
+  total_questions integer DEFAULT 10,
+  marks integer DEFAULT 100,
+  duration_minutes integer DEFAULT 30,
+  questions jsonb,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  expires_at timestamp without time zone,
+  CONSTRAINT exams_pkey PRIMARY KEY (id),
+  CONSTRAINT exams_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT exams_teacher_id_fkey FOREIGN KEY (teacher_id) REFERENCES public.users(id),
+  CONSTRAINT exams_class_id_fkey FOREIGN KEY (class_id) REFERENCES public.classes(id)
+);
+CREATE TABLE public.exam_results (
+  id integer NOT NULL DEFAULT nextval('exam_results_id_seq'::regclass),
+  school_id integer,
+  exam_id integer,
+  student_id integer,
+  score integer CHECK (score >= 0 AND score <= 500),
+  answers jsonb,
+  completed_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT exam_results_pkey PRIMARY KEY (id),
+  CONSTRAINT exam_results_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT exam_results_exam_id_fkey FOREIGN KEY (exam_id) REFERENCES public.exams(id),
+  CONSTRAINT exam_results_student_id_fkey FOREIGN KEY (student_id) REFERENCES public.users(id)
+);
+CREATE TABLE public.homework (
+  id integer NOT NULL DEFAULT nextval('homework_id_seq'::regclass),
+  school_id integer,
+  class_id integer,
+  teacher_id integer,
+  title character varying NOT NULL,
+  description text,
+  subject character varying,
+  due_date timestamp without time zone,
+  duration_value integer DEFAULT 7,
+  duration_unit character varying DEFAULT 'days'::character varying,
+  expires_at timestamp without time zone,
+  assigned_date timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  reactions jsonb DEFAULT '{}'::jsonb,
+  updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT homework_pkey PRIMARY KEY (id),
+  CONSTRAINT homework_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT homework_class_id_fkey FOREIGN KEY (class_id) REFERENCES public.classes(id),
+  CONSTRAINT homework_teacher_id_fkey FOREIGN KEY (teacher_id) REFERENCES public.users(id)
+);
+CREATE TABLE public.fee_structures (
+  id integer NOT NULL DEFAULT nextval('fee_structures_id_seq'::regclass),
+  school_id integer,
+  class_id integer,
+  monthly_fee numeric NOT NULL DEFAULT 0,
+  effective_from date NOT NULL DEFAULT CURRENT_DATE,
+  created_by integer,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  fine_amount numeric NOT NULL DEFAULT 0 CHECK (fine_amount >= 0::numeric),
+  other_charges numeric NOT NULL DEFAULT 0 CHECK (other_charges >= 0::numeric),
+  tax_percent numeric NOT NULL DEFAULT 0 CHECK (tax_percent >= 0 AND tax_percent <= 100),
+  discount_amount numeric NOT NULL DEFAULT 0 CHECK (discount_amount >= 0),
+  CONSTRAINT fee_structures_pkey PRIMARY KEY (id),
+  CONSTRAINT fee_structures_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT fee_structures_class_id_fkey FOREIGN KEY (class_id) REFERENCES public.classes(id),
+  CONSTRAINT fee_structures_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id)
+);
+CREATE TABLE public.student_fee_adjustments (
+  id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  school_id integer NOT NULL REFERENCES public.schools(id) ON DELETE CASCADE,
+  student_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  fine_amount numeric CHECK (fine_amount IS NULL OR fine_amount >= 0),
+  tax_percent numeric CHECK (tax_percent IS NULL OR tax_percent BETWEEN 0 AND 100),
+  discount_amount numeric CHECK (discount_amount IS NULL OR discount_amount >= 0),
+  remarks text,
+  updated_by integer REFERENCES public.users(id),
+  updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT student_fee_adjustments_school_student_key UNIQUE (school_id, student_id)
+);
+CREATE TABLE public.audit_logs (
+  id integer NOT NULL DEFAULT nextval('audit_logs_id_seq'::regclass),
+  school_id integer,
+  user_id integer,
+  action character varying NOT NULL,
+  entity_type character varying,
+  entity_id integer,
+  metadata jsonb,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT audit_logs_pkey PRIMARY KEY (id),
+  CONSTRAINT audit_logs_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT audit_logs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id)
+);
+CREATE TABLE public.fee_proposals (
+  id integer NOT NULL DEFAULT nextval('fee_proposals_id_seq'::regclass),
+  school_id integer NOT NULL,
+  teacher_id integer NOT NULL,
+  class_id integer NOT NULL,
+  month character varying NOT NULL,
+  year integer NOT NULL CHECK (year >= 2000 AND year <= 2200),
+  due_date date,
+  proposed_amount numeric CHECK (proposed_amount IS NULL OR proposed_amount > 0::numeric),
+  status character varying NOT NULL DEFAULT 'pending'::character varying CHECK (status::text = ANY (ARRAY['pending'::character varying, 'approved'::character varying, 'rejected'::character varying]::text[])),
+  approved_amount numeric,
+  reviewed_by integer,
+  reviewed_at timestamp without time zone,
+  review_remarks text,
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fee_proposals_pkey PRIMARY KEY (id),
+  CONSTRAINT fee_proposals_school_id_fkey FOREIGN KEY (school_id) REFERENCES public.schools(id),
+  CONSTRAINT fee_proposals_teacher_id_fkey FOREIGN KEY (teacher_id) REFERENCES public.users(id),
+  CONSTRAINT fee_proposals_class_id_fkey FOREIGN KEY (class_id) REFERENCES public.classes(id),
+  CONSTRAINT fee_proposals_reviewed_by_fkey FOREIGN KEY (reviewed_by) REFERENCES public.users(id)
+);

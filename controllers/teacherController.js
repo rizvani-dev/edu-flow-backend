@@ -18,10 +18,10 @@ const getMyStudents = async (req, res) => {
          LEFT JOIN classes c ON c.id = u.class_id
          LEFT JOIN results r ON r.student_id = u.id
          WHERE u.role = 'student' 
-          AND u.teacher_id = $1
+          AND u.teacher_id = $1 AND u.school_id = $2
          GROUP BY u.id, c.name
          ORDER BY u.name`,
-        [teacherId]
+        [teacherId, req.user.school_id]
       );
 
       return { success: true, students: mapMediaFieldsList(rows, ['profile_image']) };
@@ -112,9 +112,9 @@ const updateStudent = async (req, res) => {
     const { rows } = await pool.query(
       `UPDATE users 
        SET name = $1, email = $2, bio = $3 
-       WHERE id = $4 AND teacher_id = $5 AND role = 'student'
-       RETURNING *`,
-      [name, email, bio, id, teacherId]
+       WHERE id = $4 AND teacher_id = $5 AND role = 'student' AND school_id = $6
+       RETURNING id, name, email, class_id, teacher_id, school_id, bio, profile_image`,
+      [name, email, bio, id, teacherId, req.user.school_id]
     );
 
     if (rows.length === 0) {
@@ -141,8 +141,8 @@ const deleteStudent = async (req, res) => {
   try {
     const result = await pool.query(
       `DELETE FROM users 
-       WHERE id = $1 AND teacher_id = $2 AND role = 'student'`,
-      [id, teacherId]
+       WHERE id = $1 AND teacher_id = $2 AND role = 'student' AND school_id = $3`,
+      [id, teacherId, req.user.school_id]
     );
 
     if (result.rowCount === 0) {
@@ -177,9 +177,9 @@ const updateProfile = async (req, res) => {
       `UPDATE users 
        SET bio = $1, 
            profile_image = COALESCE($2, profile_image)
-       WHERE id = $3 AND role = 'teacher'
+       WHERE id = $3 AND role = 'teacher' AND school_id = $4
        RETURNING id, name, email, bio, profile_image`,
-      [bio, profileImageUrl, teacherId]
+      [bio, profileImageUrl, teacherId, req.user.school_id]
     );
 
     res.json({
@@ -197,12 +197,80 @@ const getMySalaries = async (req, res) => {
   const teacherId = req.user.id;
   try {
     const { rows } = await pool.query(
-      `SELECT * FROM teacher_salaries WHERE teacher_id = $1 ORDER BY year DESC, month DESC, id DESC`,
-      [teacherId]
+      `SELECT *, COALESCE(amount_paid, CASE WHEN status IN ('paid', 'received') THEN amount ELSE 0 END) AS amount_paid,
+              GREATEST(amount - COALESCE(amount_paid, CASE WHEN status IN ('paid', 'received') THEN amount ELSE 0 END), 0) AS amount_pending
+       FROM teacher_salaries WHERE teacher_id = $1 AND school_id = $2
+       ORDER BY year DESC, CASE month WHEN 'January' THEN 1 WHEN 'February' THEN 2 WHEN 'March' THEN 3 WHEN 'April' THEN 4 WHEN 'May' THEN 5 WHEN 'June' THEN 6 WHEN 'July' THEN 7 WHEN 'August' THEN 8 WHEN 'September' THEN 9 WHEN 'October' THEN 10 WHEN 'November' THEN 11 WHEN 'December' THEN 12 END DESC, id DESC`,
+      [teacherId, req.user.school_id]
     );
     res.json({ success: true, salaries: mapMediaFieldsList(rows, ['payment_screenshot']) });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to load salaries' });
+  }
+};
+
+const getMySalaryRequests = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM teacher_salary_requests WHERE teacher_id = $1 AND school_id = $2 ORDER BY created_at DESC, id DESC`,
+      [req.user.id, req.user.school_id]
+    );
+    res.json({ success: true, requests: rows });
+  } catch (error) {
+    console.error('Get Salary Requests Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to load salary requests' });
+  }
+};
+
+const createMySalaryRequest = async (req, res) => {
+  const { month, year, amount, advance_percentage, request_type = 'salary', reason } = req.body;
+  const validMonths = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  const numericYear = Number(year);
+  let numericAmount = Number(amount);
+  const numericPercentage = Number(advance_percentage);
+  if (request_type === 'advance' && Number.isFinite(numericPercentage) && numericPercentage > 0) {
+    if (numericPercentage > 50) return res.status(400).json({ success: false, message: 'Advance requests are limited to 50% of the latest salary' });
+    const basis = await pool.query(
+      `SELECT amount FROM teacher_salaries WHERE teacher_id = $1 AND school_id = $2 ORDER BY year DESC,
+       CASE LOWER(month) WHEN 'january' THEN 1 WHEN 'february' THEN 2 WHEN 'march' THEN 3 WHEN 'april' THEN 4 WHEN 'may' THEN 5 WHEN 'june' THEN 6 WHEN 'july' THEN 7 WHEN 'august' THEN 8 WHEN 'september' THEN 9 WHEN 'october' THEN 10 WHEN 'november' THEN 11 WHEN 'december' THEN 12 END DESC LIMIT 1`,
+      [req.user.id, req.user.school_id]
+    );
+    if (!basis.rows.length) return res.status(409).json({ success: false, message: 'A salary record is required to calculate an advance percentage' });
+    numericAmount = Math.round(Number(basis.rows[0].amount) * numericPercentage) / 100;
+    const existingAdvance = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0)::float AS total FROM teacher_salary_advances
+       WHERE teacher_id = $1 AND school_id = $2 AND LOWER(deduction_month) = LOWER($3)
+         AND deduction_year = $4 AND status = 'approved'`,
+      [req.user.id, req.user.school_id, month, numericYear]
+    );
+    if (Number(existingAdvance.rows[0]?.total || 0) + numericAmount > Number(basis.rows[0].amount) * 0.5) {
+      return res.status(400).json({ success: false, message: 'Total approved advances for this period cannot exceed 50% of the latest salary' });
+    }
+  }
+  if (!validMonths.includes(month) || !Number.isInteger(numericYear) || numericYear < 2000 || numericYear > 2100 || !Number.isFinite(numericAmount) || numericAmount <= 0 || !String(reason || '').trim()) {
+    return res.status(400).json({ success: false, message: 'Enter a valid month, year, amount, and reason' });
+  }
+  if (!['salary', 'advance', 'correction'].includes(request_type)) {
+    return res.status(400).json({ success: false, message: 'Invalid request type' });
+  }
+  try {
+    const duplicate = await pool.query(
+      `SELECT id FROM teacher_salary_requests WHERE teacher_id = $1 AND school_id = $2 AND month = $3 AND year = $4 AND request_type = $5 AND status = 'pending'`,
+      [req.user.id, req.user.school_id, month, numericYear, request_type]
+    );
+    if (duplicate.rows.length) return res.status(409).json({ success: false, message: `You already have a pending ${request_type} request for ${month} ${numericYear}` });
+    const { rows } = await pool.query(
+      `INSERT INTO teacher_salary_requests (school_id, teacher_id, month, year, amount, request_type, reason, advance_percentage)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [req.user.school_id, req.user.id, month, numericYear, numericAmount, request_type, String(reason).trim(), request_type === 'advance' && numericPercentage > 0 ? numericPercentage : null]
+    );
+    const { rows: admins } = await pool.query(`SELECT id FROM users WHERE role = 'admin' AND school_id = $1`, [req.user.school_id]);
+    const { createNotification } = require('./notificationController');
+    await Promise.all(admins.map((admin) => createNotification(admin.id, 'Teacher salary request', `${req.user.name || `Teacher #${req.user.id}`} requested ${request_type} for ${month} ${numericYear} (PKR ${numericAmount}). [salaryRequestId:${rows[0].id}]`, 'salary_request', req.user.id, req.app.get('socketio'))));
+    res.status(201).json({ success: true, request: rows[0] });
+  } catch (error) {
+    console.error('Create Salary Request Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to submit salary request' });
   }
 };
 
@@ -211,8 +279,8 @@ const getMySalaryById = async (req, res) => {
   const { salaryId } = req.params;
   try {
     const { rows } = await pool.query(
-      `SELECT * FROM teacher_salaries WHERE id = $1 AND teacher_id = $2`,
-      [salaryId, teacherId]
+      `SELECT * FROM teacher_salaries WHERE id = $1 AND teacher_id = $2 AND school_id = $3`,
+      [salaryId, teacherId, req.user.school_id]
     );
     if (!rows.length) return res.status(404).json({ success: false, message: 'Salary record not found' });
     res.json({ success: true, salary: mapMediaFields(rows[0], ['payment_screenshot']) });
@@ -229,10 +297,10 @@ const confirmSalaryReceived = async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE teacher_salaries
-       SET status = 'received'
-       WHERE id = $1 AND teacher_id = $2
+       SET status = 'received', amount_paid = amount, paid_at = COALESCE(paid_at, CURRENT_TIMESTAMP)
+       WHERE id = $1 AND teacher_id = $2 AND school_id = $3 AND status = 'paid'
        RETURNING *`,
-      [salaryId, teacherId]
+      [salaryId, teacherId, req.user.school_id]
     );
 
     if (!rows.length) {
@@ -274,10 +342,11 @@ const rejectSalaryReceived = async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE teacher_salaries
-       SET status = 'rejected'
-       WHERE id = $1 AND teacher_id = $2
+       SET status = 'rejected', amount_paid = 0, paid_at = NULL,
+           rejected_at = CURRENT_TIMESTAMP, rejection_reason = $4
+       WHERE id = $1 AND teacher_id = $2 AND school_id = $3 AND status = 'paid'
        RETURNING *`,
-      [salaryId, teacherId]
+      [salaryId, teacherId, req.user.school_id, String(reason || 'Not received or incorrect amount').slice(0, 1000)]
     );
 
     if (!rows.length) {
@@ -312,7 +381,8 @@ const { generateSalarySlipPdf } = require('../utils/pdfGenerator');
 
 // @desc    Download Salary Slip PDF (Teacher can only access their own slip)
 const downloadSalarySlip = async (req, res) => {
-  const teacherId = req.user.id;
+  const isSchoolAdmin = req.user.role === 'admin';
+  const teacherId = isSchoolAdmin ? null : req.user.id;
   const schoolId = req.user.school_id;
   const { salaryId } = req.params;
 
@@ -326,8 +396,8 @@ const downloadSalarySlip = async (req, res) => {
        JOIN users u ON u.id = ts.teacher_id
        LEFT JOIN classes c ON c.id = u.class_id
        LEFT JOIN schools s ON s.id = ts.school_id
-       WHERE ts.id = $1 AND ts.teacher_id = $2 AND ts.school_id = $3`,
-      [salaryId, teacherId, schoolId]
+       WHERE ts.id = $1 AND ts.school_id = $2 AND ($3::int IS NULL OR ts.teacher_id = $3)`,
+      [salaryId, schoolId, teacherId]
     );
 
     if (!rows.length) {
@@ -346,7 +416,7 @@ const downloadSalarySlip = async (req, res) => {
 
     const pdfBuffer = await generateSalarySlipPdf({
       school: { id: schoolId, name: salary.school_name, logo_url: salary.school_logo_url },
-      teacher: { id: teacherId, name: salary.teacher_name, email: salary.teacher_email, class_name: salary.class_name },
+      teacher: { id: salary.teacher_id, name: salary.teacher_name, email: salary.teacher_email, class_name: salary.class_name },
       salary
     });
 
@@ -366,6 +436,8 @@ module.exports = {
   deleteStudent,
   updateProfile,
   getMySalaries,
+  getMySalaryRequests,
+  createMySalaryRequest,
   getMySalaryById,
   confirmSalaryReceived,
   rejectSalaryReceived,

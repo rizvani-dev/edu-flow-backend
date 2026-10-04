@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const { randomUUID } = require('crypto');
 const { supabase, supabaseBucket, isSupabaseConfigured } = require('../config/supabase');
+const { uploadPrivateProof } = require('../utils/privateStorage');
 const {
   MAX_MEDIA_BYTES,
   buildSafeBaseName,
@@ -100,7 +101,7 @@ const processUploadByType = async (file, kind) => {
   );
 };
 
-const createStorageUploader = (uploader, { folder, kind }) => {
+const createStorageUploader = (uploader, { folder, kind, allowLocalFallback = false }) => {
   const single = (fieldName = 'file') => (req, res, next) => {
     uploader.single(fieldName)(req, res, async (error) => {
       if (error) {
@@ -113,7 +114,7 @@ const createStorageUploader = (uploader, { folder, kind }) => {
         return;
       }
 
-      if (!isSupabaseConfigured) {
+      if (!isSupabaseConfigured && !allowLocalFallback) {
         next(new Error('Supabase storage is not configured on the server'));
         return;
       }
@@ -126,11 +127,20 @@ const createStorageUploader = (uploader, { folder, kind }) => {
           processedFile.processedOriginalName || req.file.originalname,
           processedFile.processedExtension || path.extname(processedFile.processedOriginalName || req.file.originalname)
         );
-        const result = await uploadBufferToSupabase(
-          processedFile.processedBuffer,
-          storagePath,
-          processedFile.processedMimeType || req.file.mimetype
-        );
+        let result;
+        if (isSupabaseConfigured) {
+          result = await uploadBufferToSupabase(
+            processedFile.processedBuffer,
+            storagePath,
+            processedFile.processedMimeType || req.file.mimetype
+          );
+        } else {
+          const localFilePath = path.join(__dirname, '..', 'uploads', ...storagePath.split('/'));
+          await fs.promises.mkdir(path.dirname(localFilePath), { recursive: true });
+          await fs.promises.writeFile(localFilePath, processedFile.processedBuffer, { flag: 'wx' });
+          const localUrl = `/uploads/${storagePath}`;
+          result = { path: localUrl, secure_url: localUrl, public_id: storagePath };
+        }
 
         req.file = {
           ...processedFile,
@@ -157,6 +167,49 @@ const imageFileFilter = createFileFilter(
   [/^image\//],
   ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.heic', '.heif']
 );
+
+const feeProofFileFilter = createFileFilter(
+  [/^image\/(jpeg|png|webp)$/],
+  ['.jpg', '.jpeg', '.png', '.webp']
+);
+
+const uploadFeeProof = (() => {
+  const uploader = createMemoryUploader({ fileSize: MAX_MEDIA_BYTES, fileFilter: feeProofFileFilter });
+  return {
+    single: (fieldName = 'screenshot') => (req, res, next) => {
+      uploader.single(fieldName)(req, res, async (error) => {
+        if (error) return next(error);
+        if (!req.file) return next();
+
+        try {
+          const processedFile = await processUploadByType(req.file, 'document');
+          const storagePath = buildStoragePath(
+            `fee-proofs/school-${req.user.school_id}`,
+            processedFile.processedOriginalName || req.file.originalname,
+            processedFile.processedExtension || path.extname(req.file.originalname)
+          );
+          const privateReference = await uploadPrivateProof({
+            buffer: processedFile.processedBuffer,
+            path: storagePath,
+            contentType: processedFile.processedMimeType || req.file.mimetype,
+          });
+
+          req.file = {
+            ...processedFile,
+            path: privateReference,
+            secure_url: privateReference,
+            storage_path: storagePath,
+            originalname: processedFile.processedOriginalName || req.file.originalname,
+            mimetype: processedFile.processedMimeType || req.file.mimetype,
+          };
+          return next();
+        } catch (uploadError) {
+          return next(uploadError);
+        }
+      });
+    },
+  };
+})();
 
 const documentFileFilter = createFileFilter(
   [
@@ -212,7 +265,7 @@ const uploadDoc = createStorageUploader(
     fileSize: MAX_MEDIA_BYTES,
     fileFilter: documentFileFilter,
   }),
-  { folder: 'documents', kind: 'document' }
+  { folder: 'documents', kind: 'document', allowLocalFallback: true }
 );
 
 const uploadChat = createStorageUploader(
@@ -271,6 +324,7 @@ module.exports = {
   uploadProfile,
   uploadLogo,
   uploadDoc,
+  uploadFeeProof,
   uploadChat,
   upload: tempDiskUpload,
   uploadToSupabase,

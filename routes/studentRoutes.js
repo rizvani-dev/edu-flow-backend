@@ -5,7 +5,9 @@ const router = express.Router();
 const { 
   getDashboard, 
   getMyAttendance, 
-  getMyResults 
+  getMyResults,
+  updateStudentProfile,
+  getMyLoginDevices,
 } = require('../controllers/studentController');
 
 // Import Middleware
@@ -20,5 +22,7 @@ router.use(checkRole(['student']));
 router.get('/dashboard', getDashboard);        // Full student dashboard
 router.get('/attendance', getMyAttendance);    // Own attendance only
 router.get('/results', getMyResults);          // Own results only
+router.put('/profile', updateStudentProfile);
+router.get('/login-devices', getMyLoginDevices);
 
 module.exports = router;

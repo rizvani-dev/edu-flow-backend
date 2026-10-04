@@ -17,7 +17,7 @@ function registerSocketHandlers(io, pool) {
     }
 
     const userRes = await pool.query(
-      'SELECT id, role, class_id, school_id FROM users WHERE id = $1',
+      'SELECT id, role, class_id, teacher_id, school_id FROM users WHERE id = $1',
       [normalizedUserId]
     );
     const userData = userRes.rows[0] || null;
@@ -30,6 +30,35 @@ function registerSocketHandlers(io, pool) {
     }
 
     return userData;
+  };
+
+  const canChatWith = async (sender, receiverId) => {
+    let rows;
+    try {
+      ({ rows } = await pool.query(
+        `SELECT u.id, u.role, u.class_id, u.school_id, sender.role AS sender_role,
+                sender.class_id AS sender_class_id,
+                COALESCE(sender.teacher_id, sender_class.teacher_id) AS sender_teacher_id
+         FROM users sender
+         LEFT JOIN classes sender_class ON sender_class.id = sender.class_id AND sender_class.school_id = sender.school_id
+         JOIN users u ON u.id = $2
+         WHERE sender.id = $1 AND u.school_id IS NOT DISTINCT FROM sender.school_id`,
+        [sender.id, receiverId]
+      ));
+    } catch (error) {
+      console.error('Socket chat authorization error:', error.message);
+      return false;
+    }
+    if (!rows.length) return false;
+    const target = rows[0];
+    if (target.sender_role === 'admin') return true;
+    if (target.sender_role === 'student') {
+      return target.role === 'admin' || (target.role === 'teacher' && Number(target.id) === Number(target.sender_teacher_id));
+    }
+    if (target.sender_role === 'teacher') {
+      return target.role === 'admin' || (target.role === 'student' && Number(target.class_id) === Number(target.sender_class_id));
+    }
+    return false;
   };
 
   const emitPresenceUpdate = (userContext, payload) => {
@@ -152,26 +181,38 @@ function registerSocketHandlers(io, pool) {
       socket.userContext = null;
     });
 
-    socket.on('typing', ({ receiverId }) => {
+    socket.on('typing', async ({ receiverId } = {}) => {
       const senderId = Number(socket.userId);
-      if (!senderId || !receiverId) return;
+      if (!senderId || !receiverId || !(await canChatWith(socket.data.authUser, Number(receiverId)))) return;
       socket.to(`user_${receiverId}`).emit('typing', { senderId });
     });
 
     socket.on('broadcastMessage', async (messageData) => {
       if (Number(messageData?.sender_id) !== Number(socket.userId)) return;
-      if (!messageData?.receiver_id) return;
+      if (!messageData?.id || !messageData?.receiver_id) return;
+      if (!(await canChatWith(socket.data.authUser, Number(messageData.receiver_id)))) return;
+      const persisted = await pool.query(
+        `SELECT id FROM messages WHERE id = $1 AND sender_id = $2 AND receiver_id = $3
+         AND (school_id = $4 OR school_id IS NULL)`,
+        [messageData.id, socket.userId, messageData.receiver_id, socket.data.authUser.school_id]
+      );
+      if (!persisted.rowCount) return;
       io.to(`user_${messageData.receiver_id}`).emit('receiveMessage', messageData);
     });
 
-    socket.on('deleteMessages', ({ receiverId, messageIds }) => {
-      if (!receiverId || !Array.isArray(messageIds) || !messageIds.length) return;
-      io.to(`user_${receiverId}`).emit('messagesDeleted', { messageIds });
+    socket.on('deleteMessages', async ({ receiverId, messageIds } = {}) => {
+      if (!receiverId || !Array.isArray(messageIds) || !messageIds.length || messageIds.length > 500 || !(await canChatWith(socket.data.authUser, Number(receiverId)))) return;
+      const { rows } = await pool.query(
+        `SELECT id FROM messages WHERE id = ANY($1::int[]) AND
+         ((sender_id = $2 AND receiver_id = $3) OR (sender_id = $3 AND receiver_id = $2))`,
+        [messageIds, socket.userId, receiverId]
+      );
+      if (rows.length) io.to(`user_${receiverId}`).emit('messagesDeleted', { messageIds: rows.map((row) => row.id) });
     });
 
     socket.on(
       'sendMessage',
-      async ({ receiverId, message, file_url, file_name }, ack) => {
+      async ({ receiverId, message, file_url, file_name } = {}, ack) => {
         const senderId = Number(socket.userId);
         if (!senderId || !receiverId || (!message && !file_url)) {
           if (typeof ack === 'function') {
@@ -181,18 +222,14 @@ function registerSocketHandlers(io, pool) {
         }
 
         try {
-          const recipient = await pool.query(
-            'SELECT 1 FROM users WHERE id = $1 AND school_id IS NOT DISTINCT FROM $2',
-            [receiverId, socket.data.authUser.school_id ?? null]
-          );
-          if (!recipient.rowCount) {
+          if (!(await canChatWith(socket.data.authUser, Number(receiverId)))) {
             if (typeof ack === 'function') ack({ ok: false, error: 'Invalid recipient' });
             return;
           }
           const messageType = file_url ? 'file' : 'text';
           const result = await pool.query(
-            `INSERT INTO messages (sender_id, receiver_id, message, file_url, file_name, message_type, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+            `INSERT INTO messages (sender_id, receiver_id, message, file_url, file_name, message_type, status, school_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
             [
               senderId,
               receiverId,
@@ -201,6 +238,7 @@ function registerSocketHandlers(io, pool) {
               file_name || null,
               messageType,
               'sent',
+              socket.data.authUser.school_id ?? null,
             ]
           );
 

@@ -11,6 +11,8 @@ const {
   deleteStudent, 
   updateProfile,
   getMySalaries,
+  getMySalaryRequests,
+  createMySalaryRequest,
   getMySalaryById,
   confirmSalaryReceived,
   rejectSalaryReceived,
@@ -36,6 +38,8 @@ router.put('/profile', uploadProfile.single('profile_image'), updateProfile);
 
 // Salary (teacher confirms received & downloads slip)
 router.get('/salaries', getMySalaries);
+router.get('/salary-requests', getMySalaryRequests);
+router.post('/salary-requests', createMySalaryRequest);
 router.get('/salaries/:salaryId', getMySalaryById);
 router.get('/salaries/:salaryId/slip', downloadSalarySlip);
 router.put('/salaries/:salaryId/confirm', confirmSalaryReceived);

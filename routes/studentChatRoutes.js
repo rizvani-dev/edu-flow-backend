@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 
 const { sendStudentMessage, getStudentMessages } = require('../controllers/studentChatController');
-const { getConversationMessages, sendConversationMessage } = require('../controllers/conversationController');
+const { getSchoolAdmins, getConversationMessages, sendConversationMessage } = require('../controllers/conversationController');
 const authenticateToken = require('../middleware/authMiddleware');
 const checkRole = require('../middleware/roleMiddleware');
 const { deleteMessagesBulk } = require('../controllers/chatController');
@@ -28,6 +28,7 @@ router.post('/chat-upload', uploadChat.single('file'), (req, res) => {
 
 router.post('/', uploadChat.single('file'), sendStudentMessage);
 router.post('/conversation/:userId', uploadChat.single('file'), sendConversationMessage);
+router.get('/admins', getSchoolAdmins);
 router.get('/', getStudentMessages);
 router.get('/conversation/:userId', getConversationMessages);
 router.post('/bulk-delete', deleteMessagesBulk);

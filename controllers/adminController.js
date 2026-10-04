@@ -7,44 +7,51 @@ const { del, withCache } = require('../services/cacheService');
 const getAdminDashboardCacheKey = ({ schoolId, classId, page, limit, search, month, year }) =>
   `admin:dashboard:${schoolId}:${classId || 'all'}:${page}:${limit}:${search || 'all'}:${month || 'all'}:${year || 'all'}`;
 
-const getTeacherIdForClass = async (client, classId) => {
+const getTeacherIdForClass = async (client, classId, schoolId) => {
   if (!classId) return null;
-  // Note: in a full multi-tenant app, you'd add school_id check here too
   const { rows } = await client.query(
-    'SELECT teacher_id FROM classes WHERE id = $1',
-    [classId]
+    'SELECT teacher_id FROM classes WHERE id = $1 AND school_id = $2',
+    [classId, schoolId]
   );
   return rows[0]?.teacher_id || null;
 };
 
-const syncClassAssignments = async (client, role, classId, userId) => {
-  if (!classId || isNaN(parseInt(classId))) return;
+const ensureClassBelongsToSchool = async (client, classId, schoolId) => {
+  if (!classId) return true;
+  const { rowCount } = await client.query(
+    'SELECT 1 FROM classes WHERE id = $1 AND school_id = $2',
+    [classId, schoolId]
+  );
+  return rowCount > 0;
+};
+
+const syncClassAssignments = async (client, role, classId, userId, schoolId) => {
+  if (!classId || !Number.isInteger(Number(classId))) return;
 
   if (role === 'teacher') {
-    // If another teacher was assigned to this class, clear their assignment in users table
     await client.query(
-      "UPDATE users SET class_id = NULL WHERE class_id = $1 AND role = 'teacher' AND id != $2",
-      [classId, userId]
+      "UPDATE users SET class_id = NULL WHERE class_id = $1 AND role = 'teacher' AND id != $2 AND school_id = $3",
+      [classId, userId, schoolId]
     );
 
     await client.query(
-      'UPDATE classes SET teacher_id = $1 WHERE id = $2',
-      [userId, classId]
+      'UPDATE classes SET teacher_id = $1 WHERE id = $2 AND school_id = $3',
+      [userId, classId, schoolId]
     );
 
     await client.query(
       `UPDATE users
        SET teacher_id = $1
-       WHERE role = 'student' AND class_id = $2`,
-      [userId, classId]
+       WHERE role = 'student' AND class_id = $2 AND school_id = $3`,
+      [userId, classId, schoolId]
     );
   }
 
   if (role === 'student') {
-    const teacherId = await getTeacherIdForClass(client, classId);
+    const teacherId = await getTeacherIdForClass(client, classId, schoolId);
     await client.query(
-      'UPDATE users SET teacher_id = $1 WHERE id = $2',
-      [teacherId, userId]
+      'UPDATE users SET teacher_id = $1 WHERE id = $2 AND school_id = $3',
+      [teacherId, userId, schoolId]
     );
   }
 };
@@ -89,16 +96,22 @@ const createUser = async (req, res) => {
     try {
       await client.query('BEGIN');
 
+      const classId = class_id ? Number(class_id) : null;
+      if ((class_id && (!Number.isInteger(classId) || classId < 1)) || !(await ensureClassBelongsToSchool(client, classId, schoolId))) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Select a class belonging to your school' });
+      }
+
       const hashedPassword = await bcrypt.hash(password, 10);
 
       const { rows } = await client.query(
         `INSERT INTO users (name, email, password, role, class_id, bio, profile_image, school_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING id, name, email, role, class_id, teacher_id, bio, profile_image, online, last_seen`,
-        [name, email, hashedPassword, role, class_id || null, bio || null, profile_image || null, schoolId]
+         RETURNING id, student_code, name, email, role, class_id, teacher_id, bio, profile_image, online, last_seen`,
+        [name, email, hashedPassword, role, classId, bio || null, profile_image || null, schoolId]
       );
 
-      await syncClassAssignments(client, role, class_id, rows[0].id);
+      await syncClassAssignments(client, role, classId, rows[0].id, schoolId);
 
       // Flush affected dashboard caches
       await del(`admin:dashboard:${schoolId}:*`);
@@ -136,6 +149,7 @@ const getAllUsers = async (req, res) => {
     const { rows } = await pool.query(`
       SELECT
         u.id,
+        u.student_code,
         u.name,
         u.email,
         u.role,
@@ -168,6 +182,7 @@ const updateUser = async (req, res) => {
   const { name, email, role, class_id, bio, password } = req.body;
   const profile_image = req.file ? req.file.path : null;
   if (!name || !email || !role) return res.status(400).json({ success: false, message: 'Missing required fields' });
+  if (!['student', 'teacher'].includes(role)) return res.status(400).json({ success: false, message: 'Role must be student or teacher' });
   try {
     if (await userExists(email, id)) {
       return res.status(409).json({ success: false, message: 'Email already exists' });
@@ -190,21 +205,32 @@ const updateUser = async (req, res) => {
 
       const currentUser = currentUserRes.rows[0];
 
-      if (currentUser.role === 'teacher' && currentUser.class_id && currentUser.class_id !== Number(class_id || 0)) {
+      if (currentUser.role === 'admin') {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ success: false, message: 'School administrator accounts cannot be edited here' });
+      }
+
+      const classId = class_id ? Number(class_id) : null;
+      if ((class_id && (!Number.isInteger(classId) || classId < 1)) || !(await ensureClassBelongsToSchool(client, classId, schoolId))) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Select a class belonging to your school' });
+      }
+
+      if (currentUser.role === 'teacher' && currentUser.class_id && (role !== 'teacher' || currentUser.class_id !== Number(classId || 0))) {
         await client.query(
-          'UPDATE classes SET teacher_id = NULL WHERE teacher_id = $1 AND id = $2',
-          [id, currentUser.class_id]
+          'UPDATE classes SET teacher_id = NULL WHERE teacher_id = $1 AND id = $2 AND school_id = $3',
+          [id, currentUser.class_id, schoolId]
         );
 
         // Also clear the teacher_id from students in the old class who were linked to this teacher
         await client.query(
-          "UPDATE users SET teacher_id = NULL WHERE role = 'student' AND teacher_id = $1 AND class_id = $2",
-          [id, currentUser.class_id]
+          "UPDATE users SET teacher_id = NULL WHERE role = 'student' AND teacher_id = $1 AND class_id = $2 AND school_id = $3",
+          [id, currentUser.class_id, schoolId]
         );
       }
 
       let passwordUpdate = '';
-      let updateValues = [name, email, role, class_id || null, bio || null, profile_image, id, schoolId];
+      let updateValues = [name, email, role, classId, bio || null, profile_image, id, schoolId];
 
       if (password && password.trim() !== '') {
         const hashedPassword = await bcrypt.hash(password, 10);
@@ -216,11 +242,11 @@ const updateUser = async (req, res) => {
         `UPDATE users
          SET name = $1, email = $2, role = $3, class_id = $4, bio = $5, profile_image = COALESCE($6, profile_image) ${passwordUpdate}
          WHERE id = $7 AND school_id = $8
-         RETURNING id, name, email, role, class_id, teacher_id, bio, profile_image, online, last_seen`,
+         RETURNING id, student_code, name, email, role, class_id, teacher_id, bio, profile_image, online, last_seen`,
         updateValues
       );
 
-      await syncClassAssignments(client, role, class_id, id);
+      await syncClassAssignments(client, role, classId, id, schoolId);
       await del(`admin:dashboard:${schoolId}:*`);
       await client.query('COMMIT');
 
@@ -268,16 +294,21 @@ const deleteUser = async (req, res) => {
 
       const user = existingRes.rows[0];
 
+      if (user.role === 'admin') {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ success: false, message: 'School administrator accounts cannot be deleted here' });
+      }
+
       if (user.role === 'teacher') {
         await client.query(
-          'UPDATE classes SET teacher_id = NULL WHERE teacher_id = $1',
-          [id]
+          'UPDATE classes SET teacher_id = NULL WHERE teacher_id = $1 AND school_id = $2',
+          [id, schoolId]
         );
         await client.query(
           `UPDATE users
            SET teacher_id = NULL
-           WHERE role = 'student' AND teacher_id = $1`,
-          [id]
+           WHERE role = 'student' AND teacher_id = $1 AND school_id = $2`,
+          [id, schoolId]
         );
       }
 
@@ -357,7 +388,7 @@ const getDashboardAnalytics = async (req, res) => {
         if (search) {
           const searchPattern = `%${search}%`;
           values.push(searchPattern);
-          filters.push(`(u.name ILIKE $${paramIdx} OR u.email ILIKE $${paramIdx} OR u.id::text ILIKE $${paramIdx})`);
+          filters.push(`(u.name ILIKE $${paramIdx} OR u.email ILIKE $${paramIdx} OR u.student_code ILIKE $${paramIdx} OR u.id::text ILIKE $${paramIdx})`);
           paramIdx++;
         }
 
@@ -369,7 +400,19 @@ const getDashboardAnalytics = async (req, res) => {
 
         const userFilter = filters.length ? `AND ${filters.join(' AND ')}` : '';
         const classFilter = 'WHERE c.school_id = $1';
-        const resultsFilter = 'WHERE r.school_id = $1';
+        const resultsFilters = ['r.school_id = $1'];
+        const resultsValues = [schoolId];
+        let resultsParamIdx = 2;
+        if (month && month !== 'all') {
+          resultsFilters.push(`TO_CHAR(r.created_at, 'FMMonth') = $${resultsParamIdx}`);
+          resultsValues.push(month);
+          resultsParamIdx++;
+        }
+        if (year) {
+          resultsFilters.push(`EXTRACT(YEAR FROM r.created_at) = $${resultsParamIdx}`);
+          resultsValues.push(year);
+        }
+        const resultsFilter = `WHERE ${resultsFilters.join(' AND ')}`;
 
         // Attendance Analytics filtering logic
         const attFilters = ['a.school_id = $1'];
@@ -420,6 +463,7 @@ const getDashboardAnalytics = async (req, res) => {
           pool.query(
         `SELECT
            u.id,
+           u.student_code,
            u.name,
            u.email,
            u.role,
@@ -448,7 +492,7 @@ const getDashboardAnalytics = async (req, res) => {
         `SELECT
            COUNT(*) FILTER (WHERE role = 'student')::int AS total_students,
            COUNT(*) FILTER (WHERE role = 'teacher')::int AS total_teachers,
-           COUNT(*) FILTER (WHERE role = 'admin')::int AS total_admins
+         COUNT(*) FILTER (WHERE role = 'admin')::int AS total_admins
          FROM users WHERE school_id = $1`,
         [schoolId]
           ),
@@ -501,10 +545,10 @@ const getDashboardAnalytics = async (req, res) => {
            COUNT(r.id)::int AS total_results
          FROM results r
          JOIN classes c ON c.id = r.class_id AND c.school_id = r.school_id
-         WHERE r.school_id = $1
+         ${resultsFilter}
          GROUP BY c.id, c.name
          ORDER BY c.name`,
-        [schoolId]
+        resultsValues
           ),
           pool.query(
         `SELECT
@@ -547,7 +591,7 @@ const getDashboardAnalytics = async (req, res) => {
          ${resultsFilter}
          GROUP BY r.subject
          ORDER BY average_marks DESC`,
-        [schoolId]
+        resultsValues
           ),
           pool.query(
         `SELECT id, title, description, date
@@ -605,7 +649,7 @@ const getUserDetails = async (req, res) => {
   const schoolId = req.user.school_id;
   try {
     const { rows } = await pool.query(
-      `SELECT u.id, u.name, u.email, u.role, u.class_id, u.teacher_id, u.bio, u.profile_image, u.online, u.last_seen, c.name as class_name 
+      `SELECT u.id, u.student_code, u.name, u.email, u.role, u.class_id, u.teacher_id, u.bio, u.profile_image, u.online, u.last_seen, c.name as class_name 
        FROM users u 
        LEFT JOIN classes c ON c.id = u.class_id AND c.school_id = u.school_id
        WHERE u.id = $1 AND u.role <> 'admin' AND u.school_id = $2`,
@@ -684,16 +728,27 @@ const addTeacherSalary = async (req, res) => {
     return res.status(400).json({ success: false, message: 'Month and year are required' });
   }
 
+  const allowedMonths = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  const salaryYear = Number(year);
+  const components = [basic_salary || req.body.amount || 0, allowances, bonus, overtime, deductions, advance, fine].map(Number);
+  if (!allowedMonths.includes(month) || !Number.isInteger(salaryYear) || salaryYear < 2000 || salaryYear > 2100) {
+    return res.status(400).json({ success: false, message: 'Enter a valid salary month and year' });
+  }
+  if (components.some((value) => !Number.isFinite(value) || value < 0) || components[0] <= 0) {
+    return res.status(400).json({ success: false, message: 'Salary amounts must be valid non-negative numbers and basic salary must be greater than zero' });
+  }
+  if (!['draft', 'pending'].includes(status)) {
+    return res.status(400).json({ success: false, message: 'New salary statements must start as draft or pending' });
+  }
+
   // Calculate Net Salary = Basic + Allowances + Bonus + Overtime - Deductions - Advance - Fine
-  const bSalary = Number(basic_salary || req.body.amount || 0);
+  const bSalary = components[0];
   const allow = Number(allowances || 0);
   const bon = Number(bonus || 0);
   const ot = Number(overtime || 0);
   const ded = Number(deductions || 0);
   const adv = Number(advance || 0);
   const fn = Number(fine || 0);
-
-  const netSalary = Math.max(0, (bSalary + allow + bon + ot) - (ded + adv + fn));
 
   try {
     const screenshotPath = file ? file.path : null;
@@ -710,6 +765,18 @@ const addTeacherSalary = async (req, res) => {
       });
     }
 
+    const advanceRows = await pool.query(
+      `SELECT id, amount, remarks FROM teacher_salary_advances
+       WHERE teacher_id = $1 AND school_id = $2 AND LOWER(deduction_month) = LOWER($3)
+         AND deduction_year = $4 AND status = 'approved' ORDER BY id`,
+      [parseInt(teacherId, 10), schoolId, month, salaryYear]
+    );
+    const approvedAdvance = advanceRows.rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+    const totalDeductions = ded + approvedAdvance;
+    const netSalary = Math.max(0, (bSalary + allow + bon + ot) - (totalDeductions + adv + fn));
+    const advanceRemarks = advanceRows.rows.map((row) => row.remarks).filter(Boolean).join('; ');
+    const salaryRemarks = [remarks, approvedAdvance ? `Advance deduction: PKR ${approvedAdvance.toLocaleString()}${advanceRemarks ? ` (${advanceRemarks})` : ''}` : ''].filter(Boolean).join(' · ') || null;
+
     const { rows } = await pool.query(
       `INSERT INTO teacher_salaries (
         teacher_id, school_id, month, year, amount,
@@ -721,17 +788,20 @@ const addTeacherSalary = async (req, res) => {
       [
         parseInt(teacherId, 10), schoolId, month, parseInt(year, 10), netSalary,
         bSalary, allow, bon, ot,
-        ded, adv, fn, status, screenshotPath,
-        remarks || null,
+        totalDeductions, adv, fn, status, screenshotPath,
+        salaryRemarks,
         status === 'approved' || status === 'paid' ? adminId : null,
         status === 'approved' || status === 'paid' ? new Date() : null
       ]
     );
 
     const salary = rows[0];
+    if (advanceRows.rows.length) {
+      await pool.query(`UPDATE teacher_salary_advances SET status = 'applied', salary_id = $1 WHERE id = ANY($2::int[]) AND status = 'approved'`, [salary.id, advanceRows.rows.map((row) => row.id)]);
+    }
     const io = req.app.get('socketio');
     const teacherNotifMessage = `Your salary statement for ${salary.month} ${salary.year} (Net: PKR ${Number(salary.amount).toLocaleString()}) has been created with status: ${salary.status}.`;
-    await createNotification(teacherId, 'New Salary Statement Issued', teacherNotifMessage, 'salary', adminId, io);
+    await createNotification(teacherId, 'New Salary Statement Issued', `${teacherNotifMessage} [salaryId:${salary.id}]`, 'salary_update', adminId, io);
 
     res.status(201).json({ success: true, message: 'Salary created successfully', salary: mapMediaFields(salary, ['payment_screenshot']) });
   } catch (error) {
@@ -761,14 +831,17 @@ const updateSalaryStatus = async (req, res) => {
        SET status = $1,
            approved_by = CASE WHEN $2::boolean THEN $3 ELSE approved_by END,
            approved_at = CASE WHEN $2::boolean THEN CURRENT_TIMESTAMP ELSE approved_at END,
-           paid_at = CASE WHEN $4::boolean THEN CURRENT_TIMESTAMP ELSE paid_at END,
+           paid_at = CASE WHEN $4::boolean THEN COALESCE(paid_at, CURRENT_TIMESTAMP) ELSE NULL END,
+           amount_paid = CASE WHEN $4::boolean THEN amount ELSE 0 END,
+           rejected_at = NULL,
+           rejection_reason = NULL,
            remarks = COALESCE($5, remarks)
-       WHERE id = $6 AND school_id = $7 
+       WHERE id = $6 AND school_id = $7 AND status <> 'received'
        RETURNING *`,
       [status, isApproved || isPaid, adminId, isPaid, remarks || null, salaryId, schoolId]
     );
 
-    if (rows.length === 0) return res.status(404).json({ success: false, message: "Salary record not found" });
+    if (rows.length === 0) return res.status(409).json({ success: false, message: "Salary record not found or locked after teacher confirmation" });
 
     const salary = rows[0];
     const io = req.app.get('socketio');
@@ -776,8 +849,8 @@ const updateSalaryStatus = async (req, res) => {
     await createNotification(
       salary.teacher_id,
       `Salary Status: ${status.toUpperCase()}`,
-      `Your salary statement for ${salary.month} ${salary.year} (PKR ${Number(salary.amount).toLocaleString()}) has been marked as ${status.toUpperCase()}.`,
-      'salary_update',
+      `Your salary statement for ${salary.month} ${salary.year} (PKR ${Number(salary.amount).toLocaleString()}) has been marked as ${status.toUpperCase()}.${isPaid ? ` [salaryId:${salary.id}]` : ''}`,
+      isPaid ? 'salary' : 'salary_update',
       adminId,
       io
     );
@@ -794,7 +867,7 @@ const deleteTeacherSalary = async (req, res) => {
   const { salaryId } = req.params;
   const schoolId = req.user.school_id;
   try {
-    const { rowCount } = await pool.query('DELETE FROM teacher_salaries WHERE id = $1 AND school_id = $2', [salaryId, schoolId]);
+    const { rowCount } = await pool.query("DELETE FROM teacher_salaries WHERE id = $1 AND school_id = $2 AND status <> 'received'", [salaryId, schoolId]);
     if (rowCount === 0) return res.status(404).json({ success: false, message: 'Salary record not found' });
     res.json({ success: true, message: 'Salary record deleted successfully' });
   } catch (error) {
@@ -815,10 +888,10 @@ const getSalaryDashboard = async (req, res) => {
         SELECT 
           COUNT(*)::int AS total_records,
           COALESCE(SUM(amount), 0)::float AS total_payroll,
-          COALESCE(SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END), 0)::float AS paid_payroll,
-          COALESCE(SUM(CASE WHEN status <> 'paid' THEN amount ELSE 0 END), 0)::float AS pending_payroll,
-          COUNT(CASE WHEN status = 'paid' THEN 1 END)::int AS paid_count,
-          COUNT(CASE WHEN status <> 'paid' THEN 1 END)::int AS pending_count
+          COALESCE(SUM(COALESCE(amount_paid, CASE WHEN status IN ('paid', 'received') THEN amount ELSE 0 END)), 0)::float AS paid_payroll,
+          COALESCE(SUM(GREATEST(amount - COALESCE(amount_paid, CASE WHEN status IN ('paid', 'received') THEN amount ELSE 0 END), 0)), 0)::float AS pending_payroll,
+          COUNT(CASE WHEN COALESCE(amount_paid, CASE WHEN status IN ('paid', 'received') THEN amount ELSE 0 END) >= amount THEN 1 END)::int AS paid_count,
+          COUNT(CASE WHEN COALESCE(amount_paid, CASE WHEN status IN ('paid', 'received') THEN amount ELSE 0 END) < amount THEN 1 END)::int AS pending_count
         FROM teacher_salaries
         WHERE school_id = $1 AND LOWER(month) = LOWER($2) AND year = $3
       `, [schoolId, month, year]),
@@ -851,13 +924,108 @@ const getSalaryDashboard = async (req, res) => {
   }
 };
 
+const getTeacherSalaryRequests = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT r.*, u.name AS teacher_name, u.email AS teacher_email
+       FROM teacher_salary_requests r JOIN users u ON u.id = r.teacher_id
+       WHERE r.school_id = $1 ORDER BY CASE WHEN r.status = 'pending' THEN 0 ELSE 1 END, r.created_at DESC`,
+      [req.user.school_id]
+    );
+    res.json({ success: true, requests: rows });
+  } catch (error) {
+    console.error('Get Teacher Salary Requests Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to load salary requests' });
+  }
+};
+
+const reviewTeacherSalaryRequest = async (req, res) => {
+  const { status, admin_response } = req.body;
+  if (!['approved', 'rejected'].includes(status)) return res.status(400).json({ success: false, message: 'Choose approved or rejected' });
+  try {
+    const requestCheck = await pool.query(`SELECT * FROM teacher_salary_requests WHERE id = $1 AND school_id = $2 AND status = 'pending'`, [req.params.requestId, req.user.school_id]);
+    if (!requestCheck.rows.length) return res.status(404).json({ success: false, message: 'Pending salary request not found' });
+    const targetRequest = requestCheck.rows[0];
+    if (status === 'approved' && targetRequest.request_type === 'advance') {
+      const salaryForPeriod = await pool.query(
+        `SELECT id, status, amount, basic_salary, allowances, bonus, overtime, deductions, advance, fine
+         FROM teacher_salaries WHERE teacher_id = $1 AND school_id = $2
+           AND LOWER(month) = LOWER($3) AND year = $4 LIMIT 1`,
+        [targetRequest.teacher_id, req.user.school_id, targetRequest.month, targetRequest.year]
+      );
+      if (salaryForPeriod.rows[0] && ['paid', 'received'].includes(salaryForPeriod.rows[0].status)) {
+        return res.status(409).json({ success: false, message: 'This salary period is already paid and locked. Choose a later deduction month.' });
+      }
+    }
+    if (status === 'approved' && targetRequest.request_type === 'salary') {
+      const existingSalary = await pool.query(`SELECT id FROM teacher_salaries WHERE teacher_id = $1 AND school_id = $2 AND LOWER(month) = LOWER($3) AND year = $4`, [targetRequest.teacher_id, req.user.school_id, targetRequest.month, targetRequest.year]);
+      if (!existingSalary.rows.length) {
+        const advances = await pool.query(
+          `SELECT id, amount, remarks FROM teacher_salary_advances
+           WHERE teacher_id = $1 AND school_id = $2 AND LOWER(deduction_month) = LOWER($3)
+             AND deduction_year = $4 AND status = 'approved' ORDER BY id`,
+          [targetRequest.teacher_id, req.user.school_id, targetRequest.month, targetRequest.year]
+        );
+        const advanceDeduction = advances.rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+        const statement = await pool.query(`INSERT INTO teacher_salaries (teacher_id, school_id, month, year, amount, basic_salary, deductions, status, remarks)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8) RETURNING id`,
+          [targetRequest.teacher_id, req.user.school_id, targetRequest.month, targetRequest.year,
+            Math.max(0, Number(targetRequest.amount) - advanceDeduction), targetRequest.amount, advanceDeduction,
+            [`Created from approved teacher salary request #${targetRequest.id}`, ...advances.rows.map((row) => row.remarks)].filter(Boolean).join(' · ')]);
+        if (advances.rows.length) await pool.query(`UPDATE teacher_salary_advances SET status = 'applied', salary_id = $1 WHERE id = ANY($2::int[]) AND status = 'approved'`, [statement.rows[0].id, advances.rows.map((row) => row.id)]);
+      }
+    }
+    const { rows } = await pool.query(
+      `UPDATE teacher_salary_requests SET status = $1, admin_response = $2, reviewed_by = $3, reviewed_at = CURRENT_TIMESTAMP
+       WHERE id = $4 AND school_id = $5 AND status = 'pending' RETURNING *`,
+      [status, admin_response || null, req.user.id, req.params.requestId, req.user.school_id]
+    );
+    if (!rows.length) return res.status(404).json({ success: false, message: 'Pending salary request not found' });
+    const request = rows[0];
+    if (status === 'approved' && request.request_type === 'advance') {
+      const advance = await pool.query(
+        `INSERT INTO teacher_salary_advances
+          (request_id, school_id, teacher_id, amount, deduction_month, deduction_year, remarks)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+        [request.id, req.user.school_id, request.teacher_id, request.amount, request.month, request.year,
+          `Advance approved from request #${request.id}: ${request.reason}${admin_response ? `; ${admin_response}` : ''}`]
+      );
+      const salaryForPeriod = await pool.query(
+        `SELECT id, status, amount, basic_salary, allowances, bonus, overtime, deductions, advance, fine
+         FROM teacher_salaries WHERE teacher_id = $1 AND school_id = $2
+           AND LOWER(month) = LOWER($3) AND year = $4 LIMIT 1`,
+        [request.teacher_id, req.user.school_id, request.month, request.year]
+      );
+      if (salaryForPeriod.rows[0]) {
+        const salary = salaryForPeriod.rows[0];
+        const deductionTotal = Number(salary.deductions || 0) + Number(request.amount);
+        const nextNet = Math.max(0, Number(salary.basic_salary || 0) + Number(salary.allowances || 0) + Number(salary.bonus || 0) + Number(salary.overtime || 0) - deductionTotal - Number(salary.advance || 0) - Number(salary.fine || 0));
+        const updated = await pool.query(
+          `UPDATE teacher_salaries SET deductions = $1, amount = $2,
+            remarks = CONCAT_WS(' · ', NULLIF(remarks, ''), $3)
+           WHERE id = $4 AND status NOT IN ('paid', 'received') RETURNING id`,
+          [deductionTotal, nextNet, advance.rows[0].remarks, salary.id]
+        );
+        if (updated.rows.length) await pool.query(`UPDATE teacher_salary_advances SET status = 'applied', salary_id = $1 WHERE id = $2`, [salary.id, advance.rows[0].id]);
+      }
+    }
+    await createNotification(request.teacher_id, `Salary request ${status}`, `Your ${request.request_type} request for ${request.month} ${request.year} was ${status}.${admin_response ? ` ${admin_response}` : ''} [salaryRequestId:${request.id}]`, 'salary_request_update', req.user.id, req.app.get('socketio'));
+    res.json({ success: true, request });
+  } catch (error) {
+    console.error('Review Salary Request Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to review salary request' });
+  }
+};
+
 const createSubscriptionRequest = async (req, res) => {
   const schoolId = req.user.school_id;
   const adminId = req.user.id;
   const { duration, price } = req.body;
   const file = req.file;
 
-  if (!duration || !price) {
+  const allowedDurations = ['15days', '1month', '3months', '6months', '1year'];
+  const numericPrice = Number(price);
+  if (!allowedDurations.includes(duration) || !Number.isFinite(numericPrice) || numericPrice <= 0) {
     return res.status(400).json({ success: false, message: 'Duration and price are required' });
   }
 
@@ -866,7 +1034,7 @@ const createSubscriptionRequest = async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO subscription_requests (school_id, admin_id, duration, price, screenshot_url)
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [schoolId, adminId, duration, price, screenshotUrl]
+      [schoolId, adminId, duration, numericPrice, screenshotUrl]
     );
 
     const superAdminsRes = await pool.query(`SELECT id FROM users WHERE role = 'super_admin'`);
@@ -951,6 +1119,8 @@ module.exports = {
   addTeacherSalary,
   updateSalaryStatus,
   getSalaryDashboard,
+  getTeacherSalaryRequests,
+  reviewTeacherSalaryRequest,
   createSubscriptionRequest,
   sendMonthlyFeeReminders
 };

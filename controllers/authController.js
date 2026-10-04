@@ -43,16 +43,24 @@ const login = async (req, res) => {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
+    const sessionId = require('crypto').randomUUID();
     const token = jwt.sign(
       { 
         id: user.id, 
         email: user.email, 
         role: user.role,
         class_id: user.class_id,
-        school_id: user.school_id
+        school_id: user.school_id,
+        session_id: sessionId
       },
       getJwtSecret(),
       { expiresIn: '7d', algorithm: 'HS256' }
+    );
+
+    await pool.query(
+      `INSERT INTO login_sessions (id, user_id, device_label, user_agent, ip_address)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [sessionId, user.id, String(req.body.device_label || 'Web browser').slice(0, 120), String(req.get('user-agent') || '').slice(0, 500), req.ip]
     );
 
     res.json({
@@ -61,6 +69,7 @@ const login = async (req, res) => {
       token,
       user: {
         id: user.id,
+        student_code: user.student_code,
         name: user.name,
         email: user.email,
         role: user.role,
